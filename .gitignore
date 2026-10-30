@@ -1,3 +1,6 @@
 __pycache__/
 *.py[cod]
 events.jsonl
+.venv/
+minitorch/cuda_kernels/
+*.so
