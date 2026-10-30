@@ -9,7 +9,7 @@ import unittest
 
 from engine import MockEngine
 from interfaces import BatchPlan, EventKind, Request, RequestState, StepResult
-from metrics import compute_metrics
+from metrics import compute_metrics, compute_request_metrics
 from scheduler import FixedBudget, OrcaScheduler, SarathiScheduler, StaticScheduler
 from scheduler.budget import BudgetContext, BudgetController
 from sim import run_simulation
@@ -142,6 +142,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(2, sum(row["kind"] == "reject" for row in rows))
         self.assertEqual(2, compute_metrics(requests, result.events).completed_requests)
         self.assertEqual(0.5, compute_metrics(requests, result.events).rejection_rate)
+        self.assertEqual(0.5, compute_metrics(requests, result.events).slo_attainment_rate)
 
     def test_metrics_known_latencies_slos_and_one_token_output(self):
         requests = [Request("a", 2, 1, 3, ttft_slo=1, tpot_slo=1),
@@ -156,6 +157,28 @@ class SchedulerTests(unittest.TestCase):
         self.assertAlmostEqual(2 / 3, metrics.requests_per_second)
         self.assertAlmostEqual(4 / 3, metrics.tokens_per_second)
         self.assertAlmostEqual(1 / 3, metrics.goodput)
+        self.assertEqual(0.5, metrics.slo_attainment_rate)
+        self.assertEqual(1, metrics.completion_rate)
+        self.assertEqual(1, metrics.token_tpot_p50)
+        self.assertEqual(1, metrics.token_tpot_p99)
+        self.assertEqual(2, metrics.e2e_p50)
+        self.assertAlmostEqual(2.98, metrics.e2e_p99)
+        self.assertEqual(4, metrics.output_tokens)
+        per_request = {
+            row.request_id: row for row in compute_request_metrics(requests, result.events)
+        }
+        self.assertEqual((1, 1, 3, True), (
+            per_request["a"].ttft,
+            per_request["a"].mean_tpot,
+            per_request["a"].e2e_latency,
+            per_request["a"].meets_slo,
+        ))
+        self.assertEqual((1, 0, 1, False), (
+            per_request["b"].ttft,
+            per_request["b"].mean_tpot,
+            per_request["b"].e2e_latency,
+            per_request["b"].meets_slo,
+        ))
 
     def test_empty_trace_and_idle_clock_jump(self):
         result = run_simulation([], OrcaScheduler(1), MockEngine(1))
