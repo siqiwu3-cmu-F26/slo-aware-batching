@@ -294,52 +294,56 @@ def _tensor_matrix_multiply(
     b_strides: Strides,
 ) -> None:
     """
-    NUMBA tensor matrix multiply function.
+    NUMBA batched matrix multiply for tensors of any rank >= 3.
 
-    Should work for any tensor shapes that broadcast as long as
-
-    ```
-    assert a_shape[-1] == b_shape[-2]
-    ```
+    The last two dimensions are multiplied; every leading dimension is a batch
+    dimension and broadcasts between ``a`` and ``b`` (so a (1, 1, S, S) mask-
+    shaped operand or a (B, h, ...) attention operand both work). Requires
+    ``a_shape[-1] == b_shape[-2]``.
 
     Optimizations:
 
-    * Outer loop in parallel
-    * No index buffers or function calls
-    * Inner loop should have no global writes, 1 multiply.
-
-
-    Args:
-        out (Storage): storage for `out` tensor
-        out_shape (Shape): shape for `out` tensor
-        out_strides (Strides): strides for `out` tensor
-        a_storage (Storage): storage for `a` tensor
-        a_shape (Shape): shape for `a` tensor
-        a_strides (Strides): strides for `a` tensor
-        b_storage (Storage): storage for `b` tensor
-        b_shape (Shape): shape for `b` tensor
-        b_strides (Strides): strides for `b` tensor
-
-    Returns:
-        None : Fills in `out`
+    * Batch loop in parallel
+    * Inner k-loop uses stride arithmetic only: no index buffers, one multiply
     """
-    a_batch_stride = a_strides[0] if a_shape[0] > 1 else 0
-    b_batch_stride = b_strides[0] if b_shape[0] > 1 else 0
+    o_bdims = len(out_shape) - 2
+    a_bdims = len(a_shape) - 2
+    b_bdims = len(b_shape) - 2
+    n_batch = 1
+    for i in range(o_bdims):
+        n_batch *= out_shape[i]
+    m_len = out_shape[-2]
+    n_len = out_shape[-1]
+    k_len = a_shape[-1]
 
-    for i1 in prange(out_shape[0]):
-        for i2 in prange(out_shape[1]):
-            for i3 in prange(out_shape[2]):
-                a_inner = i1 * a_batch_stride + i2 * a_strides[1]
-                b_inner = i1 * b_batch_stride + i3 * b_strides[2]
+    for bi in prange(n_batch):
+        out_index: Index = np.zeros(MAX_DIMS, np.int32)
+        a_index: Index = np.zeros(MAX_DIMS, np.int32)
+        b_index: Index = np.zeros(MAX_DIMS, np.int32)
+        if o_bdims > 0:
+            to_index(bi, out_shape[:o_bdims], out_index)
+            broadcast_index(out_index, out_shape[:o_bdims], a_shape[:a_bdims], a_index)
+            broadcast_index(out_index, out_shape[:o_bdims], b_shape[:b_bdims], b_index)
+        o_base = 0
+        for i in range(o_bdims):
+            o_base += out_index[i] * out_strides[i]
+        a_base = 0
+        for i in range(a_bdims):
+            a_base += a_index[i] * a_strides[i]
+        b_base = 0
+        for i in range(b_bdims):
+            b_base += b_index[i] * b_strides[i]
+
+        for i2 in range(m_len):
+            for i3 in range(n_len):
+                a_inner = a_base + i2 * a_strides[-2]
+                b_inner = b_base + i3 * b_strides[-1]
                 acc = 0.0
-                for _ in range(a_shape[2]):
+                for _ in range(k_len):
                     acc += a_storage[a_inner] * b_storage[b_inner]
-                    a_inner += a_strides[2]
-                    b_inner += b_strides[1]
-                out_position = (
-                    i1 * out_strides[0] + i2 * out_strides[1] + i3 * out_strides[2]
-                )
-                out[out_position] = acc
+                    a_inner += a_strides[-1]
+                    b_inner += b_strides[-2]
+                out[o_base + i2 * out_strides[-2] + i3 * out_strides[-1]] = acc
 
 
 tensor_matrix_multiply = njit(parallel=True, fastmath=True)(_tensor_matrix_multiply)
