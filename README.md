@@ -112,12 +112,14 @@ generate_greedy_no_cache(model, prompt_token_ids, num_tokens=8)
 ```
 
 `KVCache` preallocates keys and values for `max_slots` requests across all
-layers; `generate_greedy_cached` prefills once and then decodes one token per
-step, matching the no-cache oracle token for token.
+layers. `model(idx, start_positions, cache, slots)` runs one row per slot in
+a single forward pass even when the slots hold different numbers of cached
+tokens; shorter rows are padded and masked. `generate_greedy_cached` prefills
+once and then decodes one token per step, matching the no-cache oracle token
+for token.
 
-Engine status: model, weights, and single-request KV cache done;
-variable-length batching, the `Engine` adapter, and the chunked-prefill
-kernel are next.
+Engine status: model, weights, KV cache, and variable-length batched
+attention done; the `Engine` adapter and the chunked-prefill kernel are next.
 
 ## Key interface assumptions
 
