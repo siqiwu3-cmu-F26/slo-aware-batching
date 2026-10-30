@@ -14,8 +14,9 @@ The real MiniTorch engine and Stage 4 SLO-aware adaptation are pending.
 ├── engine/             # Mock engine; real engine plugs in here
 ├── workload.py         # Synthetic and ShareGPT trace generation
 ├── benchmark.py        # Reproducible experiment matrix runner
+├── plots.py            # Multi-seed aggregation and paper-ready plots
 ├── sim.py              # Virtual-clock simulation
-├── metrics.py          # Temporary latency and throughput metrics
+├── metrics.py          # Per-request and aggregate serving metrics
 ├── tests/              # Scheduler tests
 └── docs/proposal.md    # Project proposal
 ```
@@ -65,6 +66,18 @@ Each configuration gets a deterministic run ID and its own config, trace,
 event log, per-request metrics CSV, and summary under `benchmark-results/runs/`.
 Aggregate `summary.jsonl` and `summary.csv` files are written at the top level.
 Completed runs are reused by default; pass `--no-resume` to rerun them.
+
+Generate plots from the benchmark summary with:
+
+```bash
+python3 -m pip install -r requirements-plots.txt
+python3 plots.py --summary benchmark-results/summary.csv \
+  --output-dir figures --format png
+```
+
+The plotting pipeline reports the mean and 95% confidence interval across
+seeds. It writes throughput, P99 latency, SLO attainment, goodput, and token
+budget ablation figures, plus `aggregated_plot_data.csv` for auditing.
 
 ## Key interface assumptions
 
