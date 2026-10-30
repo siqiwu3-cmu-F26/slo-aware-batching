@@ -532,8 +532,9 @@ def tensor_from_numpy(
     """NOTE: This should ONLY be used to initialize a tensor. 
     Any other usage could result in undefined behavior.
     """
-    if ls.dtype != datatype:
-        ls = ls.astype(datatype)
+    # Flattening below copies in C order, so the strides must describe a
+    # C-contiguous array; otherwise transposed/sliced numpy inputs get scrambled.
+    ls = np.ascontiguousarray(ls, dtype=datatype)
 
     res =  minitorch.Tensor(
         v = minitorch.TensorData(

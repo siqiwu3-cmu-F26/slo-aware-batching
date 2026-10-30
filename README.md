@@ -12,6 +12,9 @@ The real MiniTorch engine and Stage 4 SLO-aware adaptation are pending.
 ├── interfaces.py       # Request, batch plan, engine API, events
 ├── scheduler/          # Static / Orca / Sarathi + budget policies
 ├── engine/             # Mock engine; real engine plugs in here
+├── minitorch/          # Vendored MiniTorch tensor runtime (CPU numba + CUDA backends)
+├── kernels/            # CUDA sources for MiniTorch's fused kernels + build script
+├── model/              # GPT-2 decoder in MiniTorch + HuggingFace weight loader
 ├── workload.py         # Synthetic and ShareGPT trace generation
 ├── benchmark.py        # Reproducible experiment matrix runner
 ├── plots.py            # Multi-seed aggregation and paper-ready plots
@@ -24,7 +27,8 @@ The real MiniTorch engine and Stage 4 SLO-aware adaptation are pending.
 
 ## Run
 
-Python 3.10+, no extra dependencies. Run from the repository root:
+Python 3.11. The scheduler, mock engine, and benchmark harness need no extra
+dependencies. Run from the repository root:
 
 ```bash
 python3 sim.py --scheduler sarathi --max-slots 4 --token-budget 32
@@ -81,6 +85,34 @@ python3 plots.py --summary benchmark-results/summary.csv \
 The plotting pipeline reports the mean and 95% confidence interval across
 seeds. It writes throughput, P99 latency, SLO attainment, goodput, and token
 budget ablation figures, plus `aggregated_plot_data.csv` for auditing.
+
+## Real GPT-2 engine (in progress)
+
+The MiniTorch GPT-2 model lives in `model/`. On CPU it runs on the numba
+`FastOps` backend; on a CUDA machine build the fused kernels first:
+
+```bash
+python3.11 -m venv .venv && .venv/bin/pip install -r requirements-engine.txt
+./kernels/compile_cuda.sh          # CUDA machines only
+.venv/bin/python -m unittest tests.test_gpt2 -v
+```
+
+The pretrained test downloads GPT-2 small from HuggingFace once and checks
+that MiniTorch logits and greedy continuations match the reference model. It
+is skipped automatically when `transformers` or the weights are unavailable.
+
+```python
+from minitorch import FastOps, TensorBackend
+from model import GPT2, hf_state_dict, load_hf_weights, generate_greedy_no_cache
+
+config, state = hf_state_dict("gpt2")
+model = GPT2(config, TensorBackend(FastOps))
+load_hf_weights(model, state)
+generate_greedy_no_cache(model, prompt_token_ids, num_tokens=8)
+```
+
+Engine status: model and weights done; KV cache, variable-length batching,
+the `Engine` adapter, and the chunked-prefill kernel are next.
 
 ## Key interface assumptions
 

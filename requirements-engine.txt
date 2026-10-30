@@ -1,0 +1,6 @@
+# Real MiniTorch GPT-2 engine. Python 3.11.
+numpy
+numba
+# Weight loading and the HuggingFace reference test only.
+torch
+transformers
