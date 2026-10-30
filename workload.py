@@ -134,23 +134,36 @@ def generate_synthetic_trace(
     output_sigma: float = 0.8,
     output_min: int = 1,
     output_max: int = 512,
+    max_total_tokens: int = 1024,
     ttft_slo: float | None = None,
     tpot_slo: float | None = None,
     burst_factor: float = 5.0,
     burst_fraction: float = 0.1,
     burst_period: float = 10.0,
 ) -> list[TraceRow]:
+    if type(max_total_tokens) is not int or max_total_tokens < 2:
+        raise ValueError("max_total_tokens must be an integer of at least 2")
+    if prompt_min + output_min > max_total_tokens:
+        raise ValueError("minimum prompt and output lengths exceed max_total_tokens")
     rng = random.Random(seed)
     arrivals = generate_arrival_times(
         count, arrival_rate, rng, arrival_mode, burst_factor, burst_fraction, burst_period
     )
-    lengths = [
-        (
+    if count == 0:
+        return []
+    lengths = []
+    max_attempts = max(1000, count * 1000)
+    for _ in range(max_attempts):
+        candidate = (
             _bounded_lognormal(rng, prompt_median, prompt_sigma, prompt_min, prompt_max),
             _bounded_lognormal(rng, output_median, output_sigma, output_min, output_max),
         )
-        for _ in range(count)
-    ]
+        if sum(candidate) <= max_total_tokens:
+            lengths.append(candidate)
+            if len(lengths) == count:
+                break
+    if len(lengths) != count:
+        raise ValueError("length distribution rarely fits max_total_tokens")
     return _trace_rows(lengths, arrivals, ttft_slo, tpot_slo)
 
 
@@ -210,13 +223,20 @@ def generate_sharegpt_trace(
     burst_factor: float = 5.0,
     burst_fraction: float = 0.1,
     burst_period: float = 10.0,
+    max_total_tokens: int = 1024,
     count_tokens: Callable[[str], int] | None = None,
 ) -> list[TraceRow]:
     path = Path(dataset_path)
     records = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(records, list):
         raise ValueError("ShareGPT dataset must be a JSON array")
-    pairs = extract_sharegpt_lengths(records, count_tokens or _gpt2_token_counter())
+    if type(max_total_tokens) is not int or max_total_tokens < 2:
+        raise ValueError("max_total_tokens must be an integer of at least 2")
+    pairs = [
+        pair
+        for pair in extract_sharegpt_lengths(records, count_tokens or _gpt2_token_counter())
+        if sum(pair) <= max_total_tokens
+    ]
     if not pairs:
         raise ValueError("ShareGPT dataset contains no valid user/assistant pairs")
 
@@ -244,6 +264,8 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--burst-factor", type=_positive_float, default=5.0)
     parser.add_argument("--burst-fraction", type=float, default=0.1)
     parser.add_argument("--burst-period", type=_positive_float, default=10.0)
+    parser.add_argument("--max-total-tokens", type=_positive_int, default=1024,
+                        help="model context limit for prompt plus output")
     parser.add_argument("--output", type=Path, required=True)
 
 
@@ -276,6 +298,7 @@ def main() -> None:
         burst_factor=args.burst_factor,
         burst_fraction=args.burst_fraction,
         burst_period=args.burst_period,
+        max_total_tokens=args.max_total_tokens,
     )
     if args.source == "synthetic":
         rows = generate_synthetic_trace(
