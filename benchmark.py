@@ -46,6 +46,7 @@ class BenchmarkConfig:
     output_sigma: float = 0.8
     output_min: int = 1
     output_max: int = 512
+    max_total_tokens: int = 1024
     burst_factor: float = 5.0
     burst_fraction: float = 0.1
     burst_period: float = 10.0
@@ -101,6 +102,7 @@ def _generate_rows(config: BenchmarkConfig) -> list[dict[str, Any]]:
         arrival_mode=config.arrival_mode,
         ttft_slo=config.ttft_slo,
         tpot_slo=config.tpot_slo,
+        max_total_tokens=config.max_total_tokens,
         burst_factor=config.burst_factor,
         burst_fraction=config.burst_fraction,
         burst_period=config.burst_period,
@@ -253,6 +255,7 @@ def main() -> None:
     parser.add_argument("--output-sigma", type=float, default=0.8)
     parser.add_argument("--output-min", type=_positive_int, default=1)
     parser.add_argument("--output-max", type=_positive_int, default=512)
+    parser.add_argument("--max-total-tokens", type=_positive_int, default=1024)
     parser.add_argument("--burst-factor", type=_positive_float, default=5.0)
     parser.add_argument("--burst-fraction", type=float, default=0.1)
     parser.add_argument("--burst-period", type=_positive_float, default=10.0)
@@ -285,6 +288,7 @@ def main() -> None:
         output_sigma=args.output_sigma,
         output_min=args.output_min,
         output_max=args.output_max,
+        max_total_tokens=args.max_total_tokens,
         burst_factor=args.burst_factor,
         burst_fraction=args.burst_fraction,
         burst_period=args.burst_period,

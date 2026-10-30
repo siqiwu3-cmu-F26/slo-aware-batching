@@ -18,7 +18,8 @@ The real MiniTorch engine and Stage 4 SLO-aware adaptation are pending.
 ├── sim.py              # Virtual-clock simulation
 ├── metrics.py          # Per-request and aggregate serving metrics
 ├── tests/              # Scheduler tests
-└── docs/proposal.md    # Project proposal
+├── docs/proposal.md    # Project proposal
+└── docs/experiment_plan.md # Fixed evaluation protocol
 ```
 
 ## Run
@@ -38,7 +39,7 @@ Generate a deterministic synthetic Poisson trace and run it with:
 
 ```bash
 python3 workload.py synthetic --num-requests 1000 --arrival-rate 5 \
-  --seed 0 --output trace.json
+  --max-total-tokens 1024 --seed 0 --output trace.json
 python3 sim.py --trace trace.json --scheduler sarathi
 ```
 
@@ -53,6 +54,8 @@ python3 workload.py sharegpt --dataset ShareGPT_V3_unfiltered_cleaned_split.json
 
 Run `python3 workload.py synthetic --help` or
 `python3 workload.py sharegpt --help` for length, SLO, and burst parameters.
+The generator rejects samples whose prompt plus output exceeds the configured
+model context limit (1024 tokens by default).
 
 Run a benchmark matrix with:
 

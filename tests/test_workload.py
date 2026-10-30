@@ -37,7 +37,36 @@ class WorkloadTests(unittest.TestCase):
         )
         self.assertTrue(all(8 <= row["prompt_len"] <= 64 for row in first))
         self.assertTrue(all(2 <= row["output_len"] <= 16 for row in first))
+        self.assertTrue(all(
+            row["prompt_len"] + row["output_len"] <= 1024 for row in first
+        ))
         self.assertTrue(all(row["ttft_slo"] == 1.5 for row in first))
+
+    def test_context_limit_filters_or_rejects_lengths(self):
+        rows = generate_synthetic_trace(
+            count=20,
+            arrival_rate=1,
+            seed=4,
+            prompt_median=8,
+            prompt_min=4,
+            prompt_max=16,
+            output_median=4,
+            output_min=2,
+            output_max=8,
+            max_total_tokens=10,
+        )
+        self.assertTrue(all(
+            row["prompt_len"] + row["output_len"] <= 10 for row in rows
+        ))
+        with self.assertRaises(ValueError):
+            generate_synthetic_trace(
+                count=1,
+                arrival_rate=1,
+                seed=0,
+                prompt_min=8,
+                output_min=4,
+                max_total_tokens=10,
+            )
 
     def test_poisson_and_bursty_arrivals_are_reproducible(self):
         for mode in ("poisson", "bursty"):
@@ -110,6 +139,22 @@ class WorkloadTests(unittest.TestCase):
         self.assertEqual({(2, 1), (1, 3)}, {
             (row["prompt_len"], row["output_len"]) for row in rows
         })
+
+        with TemporaryDirectory() as directory:
+            dataset_path = Path(directory) / "sharegpt.json"
+            dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+            filtered = generate_sharegpt_trace(
+                dataset_path,
+                count=3,
+                arrival_rate=2,
+                seed=9,
+                max_total_tokens=3,
+                count_tokens=lambda text: len(text.split()),
+            )
+        self.assertEqual(
+            {(2, 1)},
+            {(row["prompt_len"], row["output_len"]) for row in filtered},
+        )
 
 
 if __name__ == "__main__":
