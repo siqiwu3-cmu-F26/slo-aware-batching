@@ -5,7 +5,8 @@ import unittest
 import numpy as np
 
 from minitorch import FastOps, TensorBackend
-from model import GPT2, GPT2Config, generate_greedy_no_cache, hf_state_dict, load_hf_weights
+from model import (GPT2, GPT2Config, KVCache, generate_greedy_cached, generate_greedy_no_cache,
+                   hf_state_dict, load_hf_weights)
 
 BACKEND = TensorBackend(FastOps)
 PROMPT = "The quick brown fox jumps over the lazy dog because"
@@ -43,6 +44,48 @@ class TinyGPT2Tests(unittest.TestCase):
             model(np.zeros((1, 4), dtype=np.int64), start_pos=5)
 
 
+class KVCacheTests(unittest.TestCase):
+    """Gate 1: cached generation matches the no-cache oracle token by token."""
+
+    def setUp(self):
+        np.random.seed(1)
+        self.model = GPT2(GPT2Config.tiny(n_positions=32), BACKEND)
+
+    def test_cached_matches_no_cache_on_several_prompts(self):
+        cache = KVCache(self.model.config, max_slots=2)
+        rng = np.random.default_rng(3)
+        for prompt_len in (1, 2, 7, 12):
+            prompt = [int(t) for t in rng.integers(0, 64, size=prompt_len)]
+            expected = generate_greedy_no_cache(self.model, prompt, 8)
+            actual = generate_greedy_cached(self.model, cache, prompt, 8)
+            self.assertEqual(actual, expected, f"prompt_len={prompt_len}")
+        self.assertEqual(cache.free_slots, 2)
+
+    def test_slot_reuse_does_not_leak_state_between_requests(self):
+        cache = KVCache(self.model.config, max_slots=1)
+        first = generate_greedy_cached(self.model, cache, [5, 6, 7, 8, 9, 10], 5)
+        second = generate_greedy_cached(self.model, cache, [40, 41], 5)
+        self.assertEqual(first, generate_greedy_no_cache(self.model, [5, 6, 7, 8, 9, 10], 5))
+        self.assertEqual(second, generate_greedy_no_cache(self.model, [40, 41], 5))
+
+    def test_slot_accounting_and_overflow(self):
+        cache = KVCache(self.model.config, max_slots=2)
+        a, b = cache.allocate(), cache.allocate()
+        self.assertEqual({a, b}, {0, 1})
+        with self.assertRaises(RuntimeError):
+            cache.allocate()
+        cache.free(a)
+        with self.assertRaises(ValueError):
+            cache.free(a)
+        self.assertEqual(cache.allocate(), a)
+        with self.assertRaises(ValueError):
+            self.model(np.array([[1, 2, 3]]), start_pos=5, cache=cache, slot=b)  # wrong position
+        self.model(np.zeros((1, 30), dtype=np.int64), start_pos=0, cache=cache, slot=b)
+        with self.assertRaises(ValueError):
+            self.model(np.zeros((1, 3), dtype=np.int64), start_pos=30, cache=cache, slot=b)
+        self.assertEqual(cache.num_bytes, 2 * cache.k.nbytes)
+
+
 class PretrainedGPT2Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -73,3 +116,13 @@ class PretrainedGPT2Tests(unittest.TestCase):
                 logits = self.hf(self.torch.tensor([tokens])).logits[0, -1]
                 tokens.append(int(logits.argmax()))
         self.assertEqual(ours, tokens[len(self.ids):])
+
+    def test_cached_greedy_matches_huggingface(self):
+        cache = KVCache(self.model.config, max_slots=1)
+        cached = generate_greedy_cached(self.model, cache, self.ids, 6)
+        tokens = list(self.ids)
+        with self.torch.no_grad():
+            for _ in range(6):
+                logits = self.hf(self.torch.tensor([tokens])).logits[0, -1]
+                tokens.append(int(logits.argmax()))
+        self.assertEqual(cached, tokens[len(self.ids):])

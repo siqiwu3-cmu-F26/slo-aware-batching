@@ -111,8 +111,13 @@ load_hf_weights(model, state)
 generate_greedy_no_cache(model, prompt_token_ids, num_tokens=8)
 ```
 
-Engine status: model and weights done; KV cache, variable-length batching,
-the `Engine` adapter, and the chunked-prefill kernel are next.
+`KVCache` preallocates keys and values for `max_slots` requests across all
+layers; `generate_greedy_cached` prefills once and then decodes one token per
+step, matching the no-cache oracle token for token.
+
+Engine status: model, weights, and single-request KV cache done;
+variable-length batching, the `Engine` adapter, and the chunked-prefill
+kernel are next.
 
 ## Key interface assumptions
 
