@@ -13,10 +13,13 @@ from typing import Any, Iterable
 
 from engine import MockEngine
 from interfaces import Request, Scheduler
-from metrics import compute_metrics
+from metrics import compute_metrics, compute_request_metrics
 from scheduler import FixedBudget, OrcaScheduler, SarathiScheduler, StaticScheduler
 from sim import run_simulation
 from workload import generate_sharegpt_trace, generate_synthetic_trace, write_trace
+
+
+BENCHMARK_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -61,7 +64,8 @@ class BenchmarkConfig:
 
     @property
     def run_id(self) -> str:
-        encoded = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
+        payload = {"schema_version": BENCHMARK_SCHEMA_VERSION, **asdict(self)}
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()[:16]
 
 
@@ -130,6 +134,7 @@ def _make_scheduler(config: BenchmarkConfig) -> Scheduler:
 def _summary(config: BenchmarkConfig, metrics: dict[str, Any], result: Any) -> dict[str, Any]:
     return {
         "run_id": config.run_id,
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
         **asdict(config),
         **metrics,
         "steps": result.steps,
@@ -158,6 +163,15 @@ def run_one(config: BenchmarkConfig, output_dir: str | Path, resume: bool = True
         json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8"
     )
     result = run_simulation(requests, scheduler, engine, run_dir / "events.jsonl")
+    request_metrics = compute_request_metrics(requests, result.events)
+    with (run_dir / "request_metrics.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as stream:
+        fieldnames = list(request_metrics[0].to_dict()) if request_metrics else []
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        if fieldnames:
+            writer.writeheader()
+            writer.writerows(row.to_dict() for row in request_metrics)
     metrics = compute_metrics(requests, result.events).to_dict()
     summary = _summary(config, metrics, result)
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

@@ -49,6 +49,14 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertTrue((run_dir / "trace.json").exists())
                 self.assertTrue((run_dir / "events.jsonl").exists())
                 self.assertTrue((run_dir / "summary.json").exists())
+                with (run_dir / "request_metrics.csv").open(
+                    encoding="utf-8", newline=""
+                ) as stream:
+                    request_rows = list(csv.DictReader(stream))
+                self.assertEqual(8, len(request_rows))
+                self.assertIn("ttft", request_rows[0])
+                self.assertIn("mean_tpot", request_rows[0])
+                self.assertIn("e2e_latency", request_rows[0])
         self.assertEqual(2, len(summaries))
         self.assertEqual(summaries, jsonl_rows)
         self.assertEqual(2, len(csv_rows))

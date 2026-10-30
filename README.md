@@ -62,9 +62,9 @@ python3 benchmark.py --arrival-rates 1 2 4 8 --seeds 0 1 2 \
 ```
 
 Each configuration gets a deterministic run ID and its own config, trace,
-event log, and summary under `benchmark-results/runs/`. Aggregate
-`summary.jsonl` and `summary.csv` files are written at the top level. Completed
-runs are reused by default; pass `--no-resume` to rerun them.
+event log, per-request metrics CSV, and summary under `benchmark-results/runs/`.
+Aggregate `summary.jsonl` and `summary.csv` files are written at the top level.
+Completed runs are reused by default; pass `--no-resume` to rerun them.
 
 ## Key interface assumptions
 
@@ -72,6 +72,9 @@ runs are reused by default; pass `--no-resume` to rerun them.
 - Memory is capped by `max_slots` (concurrent requests), not sequence length.
 - Final prefill emits the first output token; each later decode emits one token.
 - Sarathi's minimum token budget must be at least `max_slots` to fit all decodes.
-- Times use seconds. TPOT is the mean interval between a request's output tokens.
+- Times use seconds. `tpot_p50/p99` summarize per-request mean TPOT;
+  `token_tpot_p50/p99` summarize all individual inter-token intervals.
+- SLO attainment uses all arrived requests as its denominator, so rejected and
+  incomplete requests do not attain their SLO.
 
 Full interface assumptions are in [interfaces.py](interfaces.py).
