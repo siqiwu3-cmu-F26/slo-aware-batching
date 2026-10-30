@@ -14,6 +14,7 @@ projections, GELU feed-forward) but differs where serving needs it:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
@@ -161,15 +162,27 @@ class CausalSelfAttention(Module):
         return q, kT, v
 
     def causal_mask(self, seq_len: int, start_pos: int = 0) -> Tensor:
-        """(1, 1, T, start_pos + T) additive mask.
+        """(1, 1, T, start_pos + T) additive mask for one row.
 
         Query i sits at absolute position start_pos + i and may attend to key
         positions 0 .. start_pos + i. With start_pos = 0 this is the usual
         lower-triangular mask.
         """
-        total = start_pos + seq_len
-        ones = np.ones((1, 1, seq_len, total), dtype=np.float32)
-        mask = MASK_VALUE * np.triu(ones, k=start_pos + 1)
+        return self.batched_mask(seq_len, [start_pos], start_pos + seq_len)
+
+    def batched_mask(self, seq_len: int, start_positions: Sequence[int], key_len: int) -> Tensor:
+        """(B, 1, T, key_len) additive mask, one row per request.
+
+        Row b's query i is at absolute position start_positions[b] + i and may
+        see keys 0 .. start_positions[b] + i. Keys past that are either this
+        row's future or padding added because another row is longer; both get
+        MASK_VALUE.
+        """
+        starts = np.asarray(start_positions, dtype=np.int64)[:, None, None]   # (B, 1, 1)
+        query = np.arange(seq_len, dtype=np.int64)[None, :, None]            # (1, T, 1)
+        key = np.arange(key_len, dtype=np.int64)[None, None, :]              # (1, 1, L)
+        hidden = key > starts + query                                         # (B, T, L)
+        mask = (MASK_VALUE * hidden).astype(np.float32)[:, None, :, :]
         return tensor_from_numpy(mask, backend=self.backend)
 
     def _attend(self, q: Tensor, kT: Tensor, v: Tensor, mask: Tensor) -> Tensor:
@@ -181,29 +194,39 @@ class CausalSelfAttention(Module):
         return self.out_projection(out).view(batch_size, seq_len, self.n_head * self.head_dim)
 
     def forward(self, x: Tensor, cache: KVCache | None = None, layer: int | None = None,
-                slot: int | None = None, start_pos: int = 0) -> Tensor:
+                slots: Sequence[int] | None = None,
+                start_positions: Sequence[int] | None = None) -> Tensor:
         if cache is None:
             q, kT, v = self.project_to_query_key_value(x)
             return self._attend(q, kT, v, self.causal_mask(x.shape[1]))
-        return self._forward_cached(x, cache, layer, slot, start_pos)
+        return self._forward_cached(x, cache, layer, slots, start_positions)
 
-    def _forward_cached(self, x: Tensor, cache: KVCache, layer: int, slot: int,
-                        start_pos: int) -> Tensor:
-        """One request: append this chunk's K/V to its slot, attend over the full prefix."""
+    def _forward_cached(self, x: Tensor, cache: KVCache, layer: int, slots: Sequence[int],
+                        start_positions: Sequence[int]) -> Tensor:
+        """Several requests at once, one row each, with different cached lengths.
+
+        Each row's new K/V are appended to its own slot. Then every row's full
+        prefix is copied into one (B, h, L, d) array where L is the longest
+        row; shorter rows are zero-padded at the end and masked out.
+        """
         batch_size, seq_len, n_embd = x.shape
-        if batch_size != 1:
-            raise ValueError("cached attention currently serves one slot per call")
         h, d = self.n_head, self.head_dim
-        x_flat = x.view(seq_len, n_embd)
-        q = self.q_projection(x_flat).view(1, seq_len, h, d).permute(0, 2, 1, 3)
-        k_new = self.k_projection(x_flat).to_numpy().reshape(seq_len, h, d).transpose(1, 0, 2)
-        v_new = self.v_projection(x_flat).to_numpy().reshape(seq_len, h, d).transpose(1, 0, 2)
-        cache.append(layer, slot, start_pos, k_new, v_new)
-        total = start_pos + seq_len
-        k_all, v_all = cache.prefix(layer, slot, total)           # (h, L, d) each
-        kT = tensor_from_numpy(k_all.transpose(0, 2, 1)[None], backend=self.backend)  # (1, h, d, L)
-        v = tensor_from_numpy(v_all[None], backend=self.backend)                    # (1, h, L, d)
-        return self._attend(q, kT, v, self.causal_mask(seq_len, start_pos))
+        x_flat = x.view(batch_size * seq_len, n_embd)
+        q = self.q_projection(x_flat).view(batch_size, seq_len, h, d).permute(0, 2, 1, 3)
+        k_new = self.k_projection(x_flat).to_numpy().reshape(batch_size, seq_len, h, d)
+        v_new = self.v_projection(x_flat).to_numpy().reshape(batch_size, seq_len, h, d)
+        totals = [start + seq_len for start in start_positions]
+        key_len = max(totals)
+        k_all = np.zeros((batch_size, h, key_len, d), dtype=np.float32)
+        v_all = np.zeros((batch_size, h, key_len, d), dtype=np.float32)
+        for b, (slot, start, total) in enumerate(zip(slots, start_positions, totals)):
+            cache.append(layer, slot, start, k_new[b].transpose(1, 0, 2), v_new[b].transpose(1, 0, 2))
+            k_slot, v_slot = cache.prefix(layer, slot, total)       # (h, total, d)
+            k_all[b, :, :total, :] = k_slot
+            v_all[b, :, :total, :] = v_slot
+        kT = tensor_from_numpy(k_all.transpose(0, 1, 3, 2), backend=self.backend)  # (B, h, d, L)
+        v = tensor_from_numpy(v_all, backend=self.backend)                        # (B, h, L, d)
+        return self._attend(q, kT, v, self.batched_mask(seq_len, start_positions, key_len))
 
 
 class FeedForward(Module):
@@ -256,39 +279,53 @@ class GPT2(Module):
     def blocks(self) -> list[TransformerBlock]:
         return [getattr(self, f"block_{i}") for i in range(self.n_layer)]
 
-    def forward(self, idx: np.ndarray, start_pos: int = 0, cache: KVCache | None = None,
-                slot: int | None = None) -> Tensor:
+    def forward(self, idx: np.ndarray, start_pos: int | Sequence[int] = 0,
+                cache: KVCache | None = None,
+                slot: int | Sequence[int] | None = None) -> Tensor:
         """Logits of shape (batch_size, seq_len, n_vocab) for token ids ``idx``.
 
-        ``idx`` is an integer array of shape (batch_size, seq_len). Position
-        embeddings cover ``start_pos .. start_pos + seq_len``.
+        ``idx`` is an integer array of shape (batch_size, seq_len). Without a
+        cache, ``start_pos`` is one int and position embeddings cover
+        ``start_pos .. start_pos + seq_len`` for every row.
 
-        With ``cache`` and ``slot`` given, ``idx`` must be one row whose
-        ``start_pos`` equals the slot's current length: the row is appended to
-        the slot and attends over everything cached before it. The slot length
-        advances by ``seq_len`` on return.
+        With ``cache``, ``slot`` and ``start_pos`` give one slot and one start
+        position per row (a single int is accepted for one row). Every row
+        must start exactly at its slot's current length; the row is appended
+        to that slot and attends over everything cached before it. Each slot's
+        length advances by ``seq_len`` on return.
         """
         idx = np.asarray(idx, dtype=np.int64)
         if idx.ndim != 2:
             raise ValueError("idx must have shape (batch_size, seq_len)")
         batch_size, seq_len = idx.shape
-        if start_pos < 0 or start_pos + seq_len > self.config.n_positions:
-            raise ValueError("sequence exceeds n_positions")
-        if cache is not None:
-            if slot is None or batch_size != 1:
-                raise ValueError("cached forward takes one row and a slot")
-            if cache.length(slot) != start_pos:
-                raise ValueError(f"slot {slot} holds {cache.length(slot)} positions, "
-                                 f"but start_pos is {start_pos}")
-        positions = np.arange(start_pos, start_pos + seq_len)[None, :]
-        x = self.token_embeddings(idx) + self.position_embeddings(positions)
-        for layer, block in enumerate(self.blocks()):
-            if cache is None:
+        if cache is None:
+            if not isinstance(start_pos, int):
+                raise ValueError("start_pos must be one int without a cache")
+            if start_pos < 0 or start_pos + seq_len > self.config.n_positions:
+                raise ValueError("sequence exceeds n_positions")
+            positions = np.arange(start_pos, start_pos + seq_len)[None, :]
+            x = self.token_embeddings(idx) + self.position_embeddings(positions)
+            for block in self.blocks():
                 x = block(x)
-            else:
-                x = block(x, cache=cache, layer=layer, slot=slot, start_pos=start_pos)
-        if cache is not None:
-            cache.lengths[slot] = start_pos + seq_len
+        else:
+            slots = [slot] if isinstance(slot, int) else list(slot or [])
+            starts = [start_pos] if isinstance(start_pos, int) else list(start_pos)
+            if len(slots) != batch_size or len(starts) != batch_size:
+                raise ValueError("need one slot and one start_pos per row")
+            if len(set(slots)) != batch_size:
+                raise ValueError("a slot may appear at most once per forward")
+            for s_, start in zip(slots, starts):
+                if cache.length(s_) != start:
+                    raise ValueError(f"slot {s_} holds {cache.length(s_)} positions, "
+                                     f"but start_pos is {start}")
+                if start + seq_len > self.config.n_positions:
+                    raise ValueError("sequence exceeds n_positions")
+            positions = np.asarray(starts)[:, None] + np.arange(seq_len)[None, :]
+            x = self.token_embeddings(idx) + self.position_embeddings(positions)
+            for layer, block in enumerate(self.blocks()):
+                x = block(x, cache=cache, layer=layer, slots=slots, start_positions=starts)
+            for s_, start in zip(slots, starts):
+                cache.lengths[s_] = start + seq_len
         x = self.ln_f(x.view(batch_size * seq_len, self.config.n_embd))
         return self.lm_head(x).view(batch_size, seq_len, self.config.n_vocab)
 
