@@ -13,6 +13,7 @@ The real MiniTorch engine and Stage 4 SLO-aware adaptation are pending.
 ├── scheduler/          # Static / Orca / Sarathi + budget policies
 ├── engine/             # Mock engine; real engine plugs in here
 ├── workload.py         # Synthetic and ShareGPT trace generation
+├── benchmark.py        # Reproducible experiment matrix runner
 ├── sim.py              # Virtual-clock simulation
 ├── metrics.py          # Temporary latency and throughput metrics
 ├── tests/              # Scheduler tests
@@ -51,6 +52,19 @@ python3 workload.py sharegpt --dataset ShareGPT_V3_unfiltered_cleaned_split.json
 
 Run `python3 workload.py synthetic --help` or
 `python3 workload.py sharegpt --help` for length, SLO, and burst parameters.
+
+Run a benchmark matrix with:
+
+```bash
+python3 benchmark.py --arrival-rates 1 2 4 8 --seeds 0 1 2 \
+  --token-budgets 16 32 64 --num-requests 1000 \
+  --ttft-slo 2 --tpot-slo 0.1 --output-dir benchmark-results
+```
+
+Each configuration gets a deterministic run ID and its own config, trace,
+event log, and summary under `benchmark-results/runs/`. Aggregate
+`summary.jsonl` and `summary.csv` files are written at the top level. Completed
+runs are reused by default; pass `--no-resume` to rerun them.
 
 ## Key interface assumptions
 
