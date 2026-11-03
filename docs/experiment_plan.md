@@ -275,13 +275,18 @@ python3 plots.py \
 
 ## 11. Integration checklist
 
-When teammates deliver the real engine and adaptive scheduler:
+Integration status and remaining gates:
 
-- Add real-engine selection to `benchmark.py`; keep mock mode for tests.
+- Real-engine selection is available with `--engine minitorch --model ...` in
+  both drivers; mock mode remains available for tests.
+- The adapter implements `register()`/`execute()` and currently groups unequal
+  input lengths into separate forwards. CPU tiny-model integration is tested;
+  the optimized mixed-batch kernel and GPU correctness/performance remain pending.
+- Use `--prompts` for actual prompt IDs; omitted prompts use explicitly labeled
+  synthetic length replay. Real timing defaults to wall clock, including
+  scheduling/host work, after loading and warmup.
 - Add `adaptive` to benchmark scheduler choices and plotting labels.
-- Confirm real engine implements `register()` and `execute()` from
-  `interfaces.py`.
-- Confirm CUDA-synchronized duration reporting.
+- Validate synchronized timing on the actual CUDA backend.
 - Run correctness gates before calibration.
 - Run calibration and freeze SLO/rate/budget values in a committed config.
 - Run the full matrix without changing policy parameters between systems.
