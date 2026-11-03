@@ -22,7 +22,8 @@ class Request:
     id: str
     arrival_time: float
     prompt_len: int
-    # Assumption: trace supplies output_len for the mock only; schedulers never read it.
+    # Assumption: trace supplies an engine-only stopping length for deterministic
+    # mock/real comparisons; schedulers never read it. EOS is ignored in this mode.
     output_len: int = field(repr=False)
     state: RequestState = RequestState.WAITING
     # Assumption: scheduler owns these counters and updates them after execute().
