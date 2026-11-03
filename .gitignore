@@ -1,6 +1,9 @@
 __pycache__/
 *.py[cod]
 events.jsonl
+events.engine.json
+benchmark-results/
+figures/
 .venv/
 minitorch/cuda_kernels/
 *.so

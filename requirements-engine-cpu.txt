@@ -1,0 +1,4 @@
+# Minimal inference/correctness dependencies; no weights or reference framework.
+numpy>=1.24,<2.3
+numba>=0.61,<0.62
+typing_extensions

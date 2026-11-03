@@ -82,6 +82,23 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             BenchmarkConfig("orca", 1, 0, 1, token_budget=4)
 
+    def test_engine_and_prompt_contents_change_run_identity(self):
+        mock = BenchmarkConfig("orca", 1, 0, 1)
+        real = BenchmarkConfig("orca", 1, 0, 1, engine="minitorch", model_name="tiny")
+        self.assertNotEqual(mock.run_id, real.run_id)
+        self.assertEqual("virtual", mock.clock_mode)
+        self.assertEqual("wall", real.clock_mode)
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "separate output directory"):
+                run_benchmarks([mock, real], directory)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "prompts.json"
+            path.write_text('{"a": [1, 2]}')
+            config = BenchmarkConfig("orca", 1, 0, 1, prompt_file=str(path))
+            before = config.run_id
+            path.write_text('{"a": [3, 4]}')
+            self.assertNotEqual(before, config.run_id)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-"""Small virtual-clock driver; replace MockEngine with an Engine adapter later."""
+"""Trace driver with virtual mock timing or wall-clock MiniTorch execution."""
 
 from __future__ import annotations
 
@@ -7,9 +7,14 @@ from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
-from typing import Iterable
+from time import perf_counter, sleep
+from typing import TYPE_CHECKING, Callable, Iterable, cast
 
-from engine import MockEngine
+if TYPE_CHECKING:
+    from engine.minitorch_engine import MiniTorchEngine
+
+from engine import create_engine
+from engine.factory import add_engine_arguments, config_from_args
 from interfaces import Engine, Event, EventKind, Request, RequestState, Scheduler
 from metrics import compute_metrics
 from scheduler import FixedBudget, OrcaScheduler, SarathiScheduler, StaticScheduler
@@ -23,10 +28,15 @@ class SimulationResult:
     rejected_requests: int
     deferred_requests: int
     deferred_decisions: int
+    clock_mode: str = "virtual"
 
 
 def run_simulation(requests: Iterable[Request], scheduler: Scheduler, engine: Engine,
-                   log_path: str | Path | None = None) -> SimulationResult:
+                   log_path: str | Path | None = None, *, clock_mode: str = "virtual",
+                   clock: Callable[[], float] = perf_counter,
+                   wait: Callable[[float], None] = sleep) -> SimulationResult:
+    if clock_mode not in {"virtual", "wall"}:
+        raise ValueError("clock_mode must be virtual or wall")
     # Assumption: ties preserve input order, establishing deterministic FCFS.
     requests = sorted(requests, key=lambda request: request.arrival_time)
     if scheduler.max_slots != engine.max_slots:
@@ -41,6 +51,10 @@ def run_simulation(requests: Iterable[Request], scheduler: Scheduler, engine: En
     index = 0
     now = 0.0
     steps = 0
+    # Assumption: model/trace loading and warmup happen before this clock origin.
+    # Wall mode includes scheduling, registration, host work, and execution;
+    # StepResult.duration remains diagnostic and is never added a second time.
+    origin = clock() if clock_mode == "wall" else 0.0
 
     def feed_arrivals(until: float) -> None:
         nonlocal index
@@ -55,18 +69,26 @@ def run_simulation(requests: Iterable[Request], scheduler: Scheduler, engine: En
             index += 1
 
     while index < len(requests) or scheduler.has_pending:
+        if clock_mode == "wall":
+            now = clock() - origin
         if not scheduler.has_pending:
-            now = max(now, requests[index].arrival_time)
+            if clock_mode == "wall":
+                remaining = requests[index].arrival_time - now
+                if remaining > 0:
+                    wait(remaining)
+                now = clock() - origin
+            else:
+                now = max(now, requests[index].arrival_time)
         feed_arrivals(now)
         if not scheduler.has_pending:
             continue
-        plan = scheduler.plan(now)
+        plan = scheduler.plan(clock() - origin if clock_mode == "wall" else now)
         if not plan.items:
             raise RuntimeError("scheduler has pending work but produced an empty plan")
         result = engine.execute(plan)
         if not math.isfinite(result.duration) or result.duration <= 0:
             raise ValueError("engine duration must be finite and positive")
-        now += result.duration
+        now = clock() - origin if clock_mode == "wall" else now + result.duration
         # Assumption: steps cannot be preempted. Arrivals during execution retain
         # their exact timestamps but can only be admitted on the next iteration.
         # Feed before recording completions to keep the event log chronological.
@@ -78,11 +100,12 @@ def run_simulation(requests: Iterable[Request], scheduler: Scheduler, engine: En
             for event in events:
                 stream.write(json.dumps(asdict(event)) + "\n")
     return SimulationResult(events, now, steps, scheduler.rejected_requests,
-                            scheduler.deferred_requests, scheduler.deferred_decisions)
+                            scheduler.deferred_requests, scheduler.deferred_decisions, clock_mode)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_engine_arguments(parser)
     parser.add_argument("--scheduler", choices=("static", "orca", "sarathi"), default="sarathi")
     parser.add_argument("--trace", type=Path, help="JSON array of Request constructor fields")
     parser.add_argument("--log", type=Path, default=Path("events.jsonl"))
@@ -97,11 +120,19 @@ def main() -> None:
     args = parser.parse_args()
     # Only a tiny smoke fixture; workload generation/benchmarking belong to the team.
     if args.trace is None:
-        requests = [Request("long", 0, 48, 12), Request("short", 0, 8, 2),
-                    Request("later", 0.03, 16, 4)]
+        if args.engine == "minitorch" and args.model_name == "tiny":
+            requests = [Request("long", 0, 7, 4), Request("short", 0, 2, 1),
+                        Request("later", 0.03, 5, 2)]
+        else:
+            requests = [Request("long", 0, 48, 12), Request("short", 0, 8, 2),
+                        Request("later", 0.03, 16, 4)]
     else:
         requests = [Request(**row) for row in json.loads(args.trace.read_text(encoding="utf-8"))]
-    engine = MockEngine(args.max_slots, args.a, args.b)
+    clock_mode = args.clock_mode or ("wall" if args.engine == "minitorch" else "virtual")
+    if args.engine == "mock" and clock_mode != "virtual":
+        parser.error("mock engine requires --clock virtual")
+    # Validate flags before the potentially slow model load and warmup.
+    engine = create_engine(config_from_args(args), args.max_slots, args.a, args.b)
     scheduler: Scheduler
     if args.scheduler == "sarathi":
         policy = FixedBudget(args.token_budget, args.min_budget, args.max_budget,
@@ -110,10 +141,17 @@ def main() -> None:
     else:
         scheduler_class = StaticScheduler if args.scheduler == "static" else OrcaScheduler
         scheduler = scheduler_class(args.max_slots, args.max_queue_size)
-    result = run_simulation(requests, scheduler, engine, args.log)
+    result = run_simulation(requests, scheduler, engine, args.log, clock_mode=clock_mode)
     summary = compute_metrics(requests, result.events).to_dict()
     summary.update(steps=result.steps, deferred_requests=result.deferred_requests,
-                   deferred_decisions=result.deferred_decisions)
+                   deferred_decisions=result.deferred_decisions, engine=args.engine,
+                   clock_mode=result.clock_mode)
+    if args.engine == "minitorch":
+        real_engine = cast("MiniTorchEngine", engine)
+        # Preserve actual tokens and execution limitations next to the event log.
+        artifact = {"metadata": real_engine.metadata, "prompts": real_engine.prompt_tokens,
+                    "outputs": real_engine.output_tokens, "forward_calls": real_engine.forward_calls}
+        args.log.with_suffix(".engine.json").write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))
 
 

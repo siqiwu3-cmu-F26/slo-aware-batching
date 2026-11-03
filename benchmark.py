@@ -5,13 +5,18 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, cast
 
-from engine import MockEngine
+if TYPE_CHECKING:
+    from engine.minitorch_engine import MiniTorchEngine
+
+from engine import EngineConfig, create_engine
+from engine.factory import add_engine_arguments, runtime_metadata
 from interfaces import Request, Scheduler
 from metrics import compute_metrics, compute_request_metrics
 from scheduler import FixedBudget, OrcaScheduler, SarathiScheduler, StaticScheduler
@@ -19,7 +24,28 @@ from sim import run_simulation
 from workload import generate_sharegpt_trace, generate_synthetic_trace, write_trace
 
 
-BENCHMARK_SCHEMA_VERSION = 2
+BENCHMARK_SCHEMA_VERSION = 3
+
+
+@lru_cache(maxsize=256)
+def _file_digest(filename: str, modified_ns: int, size: int) -> str:
+    # Stat-keyed cache avoids rereading a large ShareGPT snapshot per matrix row.
+    with Path(filename).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+@lru_cache(maxsize=1)
+def _implementation_digest() -> str:
+    # Sources are fixed for one process; hash them once, not per run_id access.
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    sources = [root / name for name in ("benchmark.py", "sim.py", "interfaces.py", "metrics.py", "workload.py")]
+    for directory in ("engine", "scheduler", "model", "minitorch"):
+        sources.extend(sorted((root / directory).glob("*.py")))
+    for path in sources:
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -50,8 +76,21 @@ class BenchmarkConfig:
     burst_factor: float = 5.0
     burst_fraction: float = 0.1
     burst_period: float = 10.0
+    engine: str = "mock"
+    model_name: str = "gpt2"
+    backend: str = "cpu"
+    model_seed: int = 0
+    prompt_seed: int = 0
+    prompt_file: str | None = None
+    warmup_steps: int = 20
+    clock_mode: str | None = None
 
     def __post_init__(self) -> None:
+        self.engine_config  # Validate engine options without importing MiniTorch.
+        if self.clock_mode is None:
+            object.__setattr__(self, "clock_mode", "wall" if self.engine == "minitorch" else "virtual")
+        if self.clock_mode not in {"virtual", "wall"} or (self.engine == "mock" and self.clock_mode != "virtual"):
+            raise ValueError("mock requires a virtual clock; real engine accepts virtual or wall")
         if self.scheduler not in {"static", "orca", "sarathi"}:
             raise ValueError("unsupported scheduler")
         if self.scheduler == "sarathi" and self.token_budget is None:
@@ -64,8 +103,19 @@ class BenchmarkConfig:
             raise ValueError("ShareGPT source requires a dataset")
 
     @property
+    def engine_config(self) -> EngineConfig:
+        return EngineConfig(**{name: getattr(self, name) for name in EngineConfig.__dataclass_fields__})
+
+    @property
     def run_id(self) -> str:
         payload = {"schema_version": BENCHMARK_SCHEMA_VERSION, **asdict(self)}
+        # Distinguish input contents and implementation changes, not just paths.
+        payload["implementation_sha256"] = _implementation_digest()
+        for name in ("dataset", "prompt_file"):
+            filename = getattr(self, name)
+            if filename is not None:
+                stat = Path(filename).stat()
+                payload[f"{name}_sha256"] = _file_digest(str(Path(filename).resolve()), stat.st_mtime_ns, stat.st_size)
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()[:16]
 
@@ -148,7 +198,9 @@ def _summary(config: BenchmarkConfig, metrics: dict[str, Any], result: Any) -> d
 def run_one(config: BenchmarkConfig, output_dir: str | Path, resume: bool = True) -> dict[str, Any]:
     run_dir = Path(output_dir) / "runs" / config.run_id
     summary_path = run_dir / "summary.json"
-    if resume and summary_path.exists():
+    # Real timing/model/hardware can change between invocations. Until checkpoint
+    # revisions and hardware are pinned, always rerun real configurations.
+    if resume and config.engine == "mock" and summary_path.exists():
         saved = json.loads(summary_path.read_text(encoding="utf-8"))
         if saved.get("run_id") != config.run_id:
             raise ValueError(f"invalid saved summary in {run_dir}")
@@ -158,13 +210,13 @@ def run_one(config: BenchmarkConfig, output_dir: str | Path, resume: bool = True
     rows = _generate_rows(config)
     requests = [Request(**row) for row in rows]
     scheduler = _make_scheduler(config)
-    engine = MockEngine(config.max_slots, config.engine_a, config.engine_b)
+    engine = create_engine(config.engine_config, config.max_slots, config.engine_a, config.engine_b)
 
     write_trace(rows, run_dir / "trace.json")
     (run_dir / "config.json").write_text(
         json.dumps(asdict(config), indent=2) + "\n", encoding="utf-8"
     )
-    result = run_simulation(requests, scheduler, engine, run_dir / "events.jsonl")
+    result = run_simulation(requests, scheduler, engine, run_dir / "events.jsonl", clock_mode=config.clock_mode)
     request_metrics = compute_request_metrics(requests, result.events)
     with (run_dir / "request_metrics.csv").open(
         "w", encoding="utf-8", newline=""
@@ -176,6 +228,16 @@ def run_one(config: BenchmarkConfig, output_dir: str | Path, resume: bool = True
             writer.writerows(row.to_dict() for row in request_metrics)
     metrics = compute_metrics(requests, result.events).to_dict()
     summary = _summary(config, metrics, result)
+    metadata = {"runtime": runtime_metadata(), "clock_mode": config.clock_mode,
+                "engine": config.engine}
+    if config.engine == "minitorch":
+        real_engine = cast("MiniTorchEngine", engine)
+        metadata.update(real_engine.metadata)
+        summary.update(execution_mode=real_engine.metadata["execution_mode"],
+                       prompt_source=real_engine.metadata["prompt_source"], forward_calls=real_engine.forward_calls)
+        for name, values in (("prompts", real_engine.prompt_tokens), ("outputs", real_engine.output_tokens)):
+            (run_dir / f"{name}.json").write_text(json.dumps(values, indent=2) + "\n", encoding="utf-8")
+    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 
@@ -199,6 +261,8 @@ def run_benchmarks(
     configs: Iterable[BenchmarkConfig], output_dir: str | Path, resume: bool = True
 ) -> list[dict[str, Any]]:
     configs = list(configs)
+    if len({(config.engine, config.model_name, config.backend, config.clock_mode) for config in configs}) > 1:
+        raise ValueError("run each engine/model/backend/clock combination in a separate output directory")
     run_ids = [config.run_id for config in configs]
     if len(run_ids) != len(set(run_ids)):
         raise ValueError("benchmark matrix contains duplicate configurations")
@@ -232,6 +296,7 @@ def _positive_float(value: str) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_engine_arguments(parser)
     parser.add_argument("--schedulers", nargs="+", choices=("static", "orca", "sarathi"),
                         default=("static", "orca", "sarathi"))
     parser.add_argument("--arrival-rates", nargs="+", type=_positive_float, required=True)
@@ -292,6 +357,8 @@ def main() -> None:
         burst_factor=args.burst_factor,
         burst_fraction=args.burst_fraction,
         burst_period=args.burst_period,
+        **{name: getattr(args, name) for name in EngineConfig.__dataclass_fields__},
+        clock_mode=args.clock_mode,
     )
     configs = build_matrix(
         args.schedulers, args.arrival_rates, args.seeds, args.token_budgets, **common

@@ -3,15 +3,16 @@
 GPT-2 serving scheduler for MiniTorch. Goal: maximize requests completed within
 latency targets.
 
-Static, Orca, and Sarathi scheduling currently run on a mock engine.
-The real MiniTorch engine and Stage 4 SLO-aware adaptation are pending.
+Static, Orca, and Sarathi run with either the mock engine or a MiniTorch adapter.
+The adapter currently groups inputs by length; the mixed-batch kernel and
+Stage 4 SLO-aware adaptation are pending.
 
 ## Structure
 
 ```text
 ├── interfaces.py       # Request, batch plan, engine API, events
 ├── scheduler/          # Static / Orca / Sarathi + budget policies
-├── engine/             # Mock engine; real engine plugs in here
+├── engine/             # Mock engine + MiniTorch adapter and loading
 ├── minitorch/          # Vendored MiniTorch tensor runtime (CPU numba + CUDA backends)
 ├── kernels/            # CUDA sources for MiniTorch's fused kernels + build script
 ├── model/              # GPT-2 decoder in MiniTorch + HuggingFace weight loader
@@ -86,40 +87,36 @@ The plotting pipeline reports the mean and 95% confidence interval across
 seeds. It writes throughput, P99 latency, SLO attainment, goodput, and token
 budget ablation figures, plus `aggregated_plot_data.csv` for auditing.
 
-## Real GPT-2 engine (in progress)
+## MiniTorch integration
 
-The MiniTorch GPT-2 model lives in `model/`. On CPU it runs on the numba
-`FastOps` backend; on a CUDA machine build the fused kernels first:
+CPU smoke test with a tiny random-weight model (no downloads or training):
 
 ```bash
-python3.11 -m venv .venv && .venv/bin/pip install -r requirements-engine.txt
-./kernels/compile_cuda.sh          # CUDA machines only
-.venv/bin/python -m unittest tests.test_gpt2 -v
+python3.11 -m venv .venv
+.venv/bin/pip install -r requirements-engine-cpu.txt
+NUMBA_NUM_THREADS=1 .venv/bin/python sim.py --engine minitorch --model tiny \
+  --scheduler sarathi --max-slots 2 --token-budget 4
+NUMBA_NUM_THREADS=1 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-The pretrained test downloads GPT-2 small from HuggingFace once and checks
-that MiniTorch logits and greedy continuations match the reference model. It
-is skipped automatically when `transformers` or the weights are unavailable.
+For pretrained GPT-2, install `requirements-engine.txt` and use `--model gpt2`
+or `--model gpt2-medium`. CUDA additionally requires `pycuda` and
+`./kernels/compile_cuda.sh`; select it with `--backend cuda`.
 
-```python
-from minitorch import FastOps, TensorBackend
-from model import GPT2, hf_state_dict, load_hf_weights, generate_greedy_no_cache
+Both `sim.py` and `benchmark.py` accept `--engine minitorch`. Model loading and
+20 warmup steps precede wall-clock measurement. `--prompts prompts.json` supplies
+a mapping of request IDs to token-ID lists; otherwise inputs are deterministic
+synthetic tokens replaying the trace's lengths. The adapter generates exactly
+`output_len` tokens and ignores EOS. Actual inputs, outputs, and execution
+metadata are saved alongside results.
 
-config, state = hf_state_dict("gpt2")
-model = GPT2(config, TensorBackend(FastOps))
-load_hf_weights(model, state)
-generate_greedy_no_cache(model, prompt_token_ids, num_tokens=8)
-```
-
-`KVCache` preallocates keys and values for `max_slots` requests across all
-layers. `model(idx, start_positions, cache, slots)` runs one row per slot in
-a single forward pass even when the slots hold different numbers of cached
-tokens; shorter rows are padded and masked. `generate_greedy_cached` prefills
-once and then decodes one token per step, matching the no-cache oracle token
-for token.
-
-Engine status: model, weights, KV cache, and variable-length batched
-attention done; the `Engine` adapter and the chunked-prefill kernel are next.
+Unequal input lengths use separate forwards; this path has CPU correctness
+coverage and still needs GPU validation and the optimized mixed-batch kernel.
+The KV cache is host-resident numpy (`kv_storage: host_numpy` in metadata), so
+`--backend cuda` timings include per-step host/device cache transfers; label
+GPU numbers accordingly until the cache moves to the device. A benchmark
+process loads the model once and gives each run a fresh KV cache and warmup.
+See [integration status and midterm handoff](docs/midterm_progress.md).
 
 ## Key interface assumptions
 
