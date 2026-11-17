@@ -63,8 +63,21 @@ class MiniTorchEngineTests(unittest.TestCase):
             self.assertEqual(expected, engine.output_tokens["a"])
             self.assertEqual(1, engine.cache.free_slots)
 
-    def test_equal_spans_batch_and_mixed_spans_use_separate_forwards(self):
+    def test_ragged_mode_runs_a_mixed_plan_in_one_forward(self):
         engine = MiniTorchEngine(self.model, 3, {"a": [1, 2], "b": [3, 4], "c": [5, 6, 7]})
+        for rid, length in (("a", 2), ("b", 2), ("c", 3)):
+            engine.register(Request(rid, 0, length, 3))
+        with patch.object(self.model, "forward_ragged", wraps=self.model.forward_ragged) as forward:
+            engine.execute(BatchPlan([("a", 0, 2), ("b", 0, 2)]))
+            engine.execute(BatchPlan([("a", 2, 1), ("b", 2, 1), ("c", 0, 3)], token_budget=5))
+            self.assertEqual(2, forward.call_count)
+            rows = forward.call_args.args[0]
+            self.assertEqual([1, 1, 3], [len(row) for row in rows])
+        self.assertEqual(2, engine.forward_calls)
+
+    def test_grouped_mode_batches_equal_spans_and_separates_mixed_spans(self):
+        engine = MiniTorchEngine(self.model, 3, {"a": [1, 2], "b": [3, 4], "c": [5, 6, 7]},
+                                 execution_mode="grouped")
         for rid, length in (("a", 2), ("b", 2), ("c", 3)):
             engine.register(Request(rid, 0, length, 3))
         with patch.object(self.model, "forward", wraps=self.model.forward) as forward:
@@ -75,8 +88,42 @@ class MiniTorchEngineTests(unittest.TestCase):
             engine.execute(BatchPlan([("a", 2, 1), ("b", 2, 1), ("c", 0, 3)], token_budget=5))
             self.assertEqual([(2, 1), (1, 3)], [call.args[0].shape for call in forward.call_args_list])
 
-    def test_failed_later_forward_rolls_back_earlier_groups(self):
+    def test_both_modes_match_independent_outputs_under_all_schedulers(self):
+        prompts = {"a": [1, 2, 3, 4, 5, 6, 7], "b": [8, 9], "c": [10, 11, 12, 13, 14], "d": [15, 16, 17]}
+        lengths = {"a": 4, "b": 1, "c": 3, "d": 2}
+        expected = {rid: generate_greedy_no_cache(self.model, prompt, lengths[rid])
+                    for rid, prompt in prompts.items()}
+        for mode in ("ragged", "grouped"):
+            for make in (lambda: StaticScheduler(2), lambda: OrcaScheduler(2),
+                         lambda: SarathiScheduler(2, FixedBudget(3))):
+                engine = MiniTorchEngine(self.model, 2, prompts, execution_mode=mode)
+                requests = [Request(rid, 0, len(prompt), lengths[rid]) for rid, prompt in prompts.items()]
+                run_simulation(requests, make(), engine)
+                with self.subTest(mode=mode, scheduler=type(make()).__name__):
+                    self.assertEqual(expected, engine.output_tokens)
+                    self.assertEqual(2, engine.cache.free_slots)
+
+    def test_failed_ragged_forward_rolls_back_progress_and_slots(self):
         engine = MiniTorchEngine(self.model, 3, {"a": [1, 2], "b": [3], "c": [5, 6, 7]})
+        for rid, length, output in (("a", 2, 1), ("b", 1, 2), ("c", 3, 1)):
+            engine.register(Request(rid, 0, length, output))
+        engine.execute(BatchPlan([("b", 0, 1)]))
+        lengths = engine.cache.lengths.copy()
+        plan = BatchPlan([("a", 0, 2), ("b", 1, 1), ("c", 0, 3)])
+        with patch.object(self.model, "forward_ragged", side_effect=RuntimeError("injected")):
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                engine.execute(plan)
+        self.assertEqual(lengths.tolist(), engine.cache.lengths.tolist())
+        self.assertEqual(2, engine.cache.free_slots)
+        self.assertEqual({"a": [], "b": engine.output_tokens["b"][:1], "c": []}, engine.output_tokens)
+        result = engine.execute(plan)
+        self.assertEqual(("a", "b", "c"), result.finished_requests)
+        for rid, prompt, output in (("a", [1, 2], 1), ("b", [3], 2), ("c", [5, 6, 7], 1)):
+            self.assertEqual(generate_greedy_no_cache(self.model, prompt, output), engine.output_tokens[rid])
+
+    def test_failed_later_forward_rolls_back_earlier_groups(self):
+        engine = MiniTorchEngine(self.model, 3, {"a": [1, 2], "b": [3], "c": [5, 6, 7]},
+                                 execution_mode="grouped")
         for rid, length, output in (("a", 2, 1), ("b", 1, 2), ("c", 3, 1)):
             engine.register(Request(rid, 0, length, output))
         engine.execute(BatchPlan([("b", 0, 1)]))
@@ -172,7 +219,7 @@ class MiniTorchEngineTests(unittest.TestCase):
                 self.assertEqual(3, summary["completed_requests"])
                 self.assertEqual("wall", summary["clock_mode"])
                 self.assertEqual("random_smoke_only", metadata["weights"])
-                self.assertEqual("grouped_by_input_length", summary["execution_mode"])
+                self.assertEqual("ragged_single_forward", summary["execution_mode"])
                 self.assertEqual("synthetic_length_replay", summary["prompt_source"])
                 for rid, tokens in generated.items():
                     self.assertEqual(generate_greedy_no_cache(self.model, prompts[rid], len(tokens)), tokens)

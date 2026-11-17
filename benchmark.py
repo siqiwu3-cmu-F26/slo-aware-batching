@@ -83,6 +83,7 @@ class BenchmarkConfig:
     prompt_seed: int = 0
     prompt_file: str | None = None
     warmup_steps: int = 20
+    execution_mode: str = "ragged"
     clock_mode: str | None = None
 
     def __post_init__(self) -> None:

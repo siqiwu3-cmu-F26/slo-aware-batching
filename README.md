@@ -110,8 +110,13 @@ synthetic tokens replaying the trace's lengths. The adapter generates exactly
 `output_len` tokens and ignores EOS. Actual inputs, outputs, and execution
 metadata are saved alongside results.
 
-Unequal input lengths use separate forwards; this path has CPU correctness
-coverage and still needs GPU validation and the optimized mixed-batch kernel.
+By default every plan runs in one forward (`--execution-mode ragged`): rows of
+different lengths, such as a prefill chunk beside several decodes, pass through
+the per-token layers as one flat sequence, only the attention product is
+padded, and logits are computed for each row's last token. `--execution-mode
+grouped` keeps one forward per span length for comparison. This path has CPU
+correctness coverage and still needs GPU validation and the chunked-prefill
+kernel.
 The KV cache is host-resident numpy (`kv_storage: host_numpy` in metadata), so
 `--backend cuda` timings include per-step host/device cache transfers; label
 GPU numbers accordingly until the cache moves to the device. A benchmark

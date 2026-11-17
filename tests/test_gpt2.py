@@ -160,6 +160,73 @@ class BatchedKVCacheTests(unittest.TestCase):
             self.model(np.zeros((2, 1), dtype=np.int64), [0, 3], cache, [a, b])     # wrong position
 
 
+class RaggedForwardTests(unittest.TestCase):
+    """One forward over rows of different lengths equals each row run alone."""
+
+    def setUp(self):
+        np.random.seed(4)
+        self.model = GPT2(GPT2Config.tiny(n_positions=32), BACKEND)
+        self.rng = np.random.default_rng(11)
+
+    def _prompt(self, length):
+        return [int(t) for t in self.rng.integers(0, 64, size=length)]
+
+    def _alone(self, history, new):
+        """Last-token logits of ``new`` after ``history`` is cached, in a fresh cache."""
+        cache = KVCache(self.model.config, max_slots=1)
+        slot = cache.allocate()
+        if history:
+            self.model(np.array([history]), 0, cache, slot)
+        return self.model(np.array([new]), len(history), cache, slot).to_numpy()[0, -1]
+
+    def test_mixed_prefill_chunk_and_decodes_match_rows_alone(self):
+        # Row 0: fresh 5-token prefill. Row 1: decode after 4 cached. Row 2: 3-token
+        # prefill chunk after 6 cached. Row 3: decode after 9 cached.
+        histories = [[], self._prompt(4), self._prompt(6), self._prompt(9)]
+        rows = [self._prompt(5), self._prompt(1), self._prompt(3), self._prompt(1)]
+        expected = [self._alone(h, r) for h, r in zip(histories, rows)]
+        cache = KVCache(self.model.config, max_slots=4)
+        slots = [cache.allocate() for _ in rows]
+        for history, slot in zip(histories, slots):
+            if history:
+                self.model(np.array([history]), 0, cache, slot)
+        starts = [len(h) for h in histories]
+        logits = self.model.forward_ragged(rows, starts, cache, slots)
+        self.assertEqual(logits.shape, (4, 64))
+        for b in range(4):
+            np.testing.assert_allclose(logits[b], expected[b], rtol=1e-4, atol=1e-4)
+        self.assertEqual([cache.length(s) for s in slots], [5, 5, 9, 10])
+
+    def test_ragged_greedy_matches_no_cache_oracle(self):
+        prompts = [self._prompt(2), self._prompt(7), self._prompt(4)]
+        expected = [generate_greedy_no_cache(self.model, p, 5) for p in prompts]
+        cache = KVCache(self.model.config, max_slots=3)
+        slots = [cache.allocate() for _ in prompts]
+        logits = self.model.forward_ragged(prompts, [0, 0, 0], cache, slots)   # mixed-length prefill
+        nexts = [int(np.argmax(logits[b])) for b in range(3)]
+        generated = [[t] for t in nexts]
+        for _ in range(4):
+            starts = [cache.length(s) for s in slots]
+            logits = self.model.forward_ragged([[t] for t in nexts], starts, cache, slots)
+            nexts = [int(np.argmax(logits[b])) for b in range(3)]
+            for b in range(3):
+                generated[b].append(nexts[b])
+        self.assertEqual(generated, expected)
+
+    def test_ragged_rejects_bad_rows(self):
+        cache = KVCache(self.model.config, max_slots=2)
+        a, b = cache.allocate(), cache.allocate()
+        with self.assertRaises(ValueError):
+            self.model.forward_ragged([[1], []], [0, 0], cache, [a, b])        # empty row
+        with self.assertRaises(ValueError):
+            self.model.forward_ragged([[1], [2]], [0, 0], cache, [a, a])       # duplicate slot
+        with self.assertRaises(ValueError):
+            self.model.forward_ragged([[1], [2]], [0, 3], cache, [a, b])       # wrong position
+        with self.assertRaises(ValueError):
+            self.model.forward_ragged([[1]], [0], cache, [a, b])               # length mismatch
+        self.assertEqual([cache.length(a), cache.length(b)], [0, 0])
+
+
 class PretrainedGPT2Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -207,6 +274,27 @@ class PretrainedGPT2Tests(unittest.TestCase):
             for b in range(2):
                 generated[b].append(nexts[b])
         for p, gen in zip(prompts, generated):
+            tokens = list(p)
+            with self.torch.no_grad():
+                for _ in range(4):
+                    tokens.append(int(self.hf(self.torch.tensor([tokens])).logits[0, -1].argmax()))
+            self.assertEqual(gen, tokens[len(p):])
+
+    def test_ragged_mixed_batch_matches_huggingface(self):
+        other = self.tok("Hello, my name is")["input_ids"]
+        cache = KVCache(self.model.config, max_slots=2)
+        slots = [cache.allocate(), cache.allocate()]
+        # One call prefills both prompts of different lengths.
+        logits = self.model.forward_ragged([self.ids, other], [0, 0], cache, slots)
+        nexts = [int(np.argmax(logits[b])) for b in range(2)]
+        generated = [[t] for t in nexts]
+        for _ in range(3):
+            starts = [cache.length(s) for s in slots]
+            logits = self.model.forward_ragged([[t] for t in nexts], starts, cache, slots)
+            nexts = [int(np.argmax(logits[b])) for b in range(2)]
+            for b in range(2):
+                generated[b].append(nexts[b])
+        for p, gen in zip((self.ids, other), generated):
             tokens = list(p)
             with self.torch.no_grad():
                 for _ in range(4):

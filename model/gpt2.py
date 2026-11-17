@@ -185,21 +185,68 @@ class CausalSelfAttention(Module):
         mask = (MASK_VALUE * hidden).astype(np.float32)[:, None, :, :]
         return tensor_from_numpy(mask, backend=self.backend)
 
-    def _attend(self, q: Tensor, kT: Tensor, v: Tensor, mask: Tensor) -> Tensor:
+    def _attention_core(self, q: Tensor, kT: Tensor, v: Tensor, mask: Tensor) -> Tensor:
+        """softmax(q kT / sqrt(d) + mask) v, returned as (B*T, n_embd) before projection."""
         batch_size, _, seq_len, _ = q.shape
         attn = (q @ kT) / (self.head_dim ** 0.5)          # (B, h, T, L)
         attn = softmax(attn + mask, dim=3)
         out = (attn @ v).permute(0, 2, 1, 3).contiguous()  # (B, T, h, d)
-        out = out.view(batch_size * seq_len, self.n_head * self.head_dim)
+        return out.view(batch_size * seq_len, self.n_head * self.head_dim)
+
+    def _attend(self, q: Tensor, kT: Tensor, v: Tensor, mask: Tensor) -> Tensor:
+        batch_size, _, seq_len, _ = q.shape
+        out = self._attention_core(q, kT, v, mask)
         return self.out_projection(out).view(batch_size, seq_len, self.n_head * self.head_dim)
 
     def forward(self, x: Tensor, cache: KVCache | None = None, layer: int | None = None,
                 slots: Sequence[int] | None = None,
-                start_positions: Sequence[int] | None = None) -> Tensor:
+                start_positions: Sequence[int] | None = None,
+                counts: Sequence[int] | None = None) -> Tensor:
         if cache is None:
             q, kT, v = self.project_to_query_key_value(x)
             return self._attend(q, kT, v, self.causal_mask(x.shape[1]))
+        if counts is not None:
+            return self._forward_ragged(x, cache, layer, slots, start_positions, counts)
         return self._forward_cached(x, cache, layer, slots, start_positions)
+
+    def _forward_ragged(self, x: Tensor, cache: KVCache, layer: int, slots: Sequence[int],
+                        start_positions: Sequence[int], counts: Sequence[int]) -> Tensor:
+        """Rows of different lengths in one call; ``x`` is (1, sum(counts), n_embd).
+
+        Row b owns tokens ``offset_b .. offset_b + counts[b]`` of the flat
+        sequence. Projections run once over all tokens with no padding. Only
+        the attention product is padded: queries to the longest row, keys and
+        values to the longest prefix. Padded query rows are dropped afterwards.
+        """
+        _, n_tokens, n_embd = x.shape
+        h, d = self.n_head, self.head_dim
+        x_flat = x.view(n_tokens, n_embd)
+        q_new = self.q_projection(x_flat).to_numpy().reshape(n_tokens, h, d)
+        k_new = self.k_projection(x_flat).to_numpy().reshape(n_tokens, h, d)
+        v_new = self.v_projection(x_flat).to_numpy().reshape(n_tokens, h, d)
+        batch_size, t_max = len(slots), max(counts)
+        totals = [start + count for start, count in zip(start_positions, counts)]
+        key_len = max(totals)
+        q_pad = np.zeros((batch_size, h, t_max, d), dtype=np.float32)
+        k_all = np.zeros((batch_size, h, key_len, d), dtype=np.float32)
+        v_all = np.zeros((batch_size, h, key_len, d), dtype=np.float32)
+        offset = 0
+        for b, (slot, start, count, total) in enumerate(zip(slots, start_positions, counts, totals)):
+            rows = slice(offset, offset + count)
+            q_pad[b, :, :count, :] = q_new[rows].transpose(1, 0, 2)
+            cache.append(layer, slot, start, k_new[rows].transpose(1, 0, 2), v_new[rows].transpose(1, 0, 2))
+            k_slot, v_slot = cache.prefix(layer, slot, total)
+            k_all[b, :, :total, :] = k_slot
+            v_all[b, :, :total, :] = v_slot
+            offset += count
+        q = tensor_from_numpy(q_pad, backend=self.backend)
+        kT = tensor_from_numpy(k_all.transpose(0, 1, 3, 2), backend=self.backend)
+        v = tensor_from_numpy(v_all, backend=self.backend)
+        mask = self.batched_mask(t_max, start_positions, key_len)
+        core = self._attention_core(q, kT, v, mask).to_numpy().reshape(batch_size, t_max, n_embd)
+        gathered = np.concatenate([core[b, :count] for b, count in enumerate(counts)], axis=0)
+        out = self.out_projection(tensor_from_numpy(gathered, backend=self.backend))
+        return out.view(1, n_tokens, n_embd)
 
     def _forward_cached(self, x: Tensor, cache: KVCache, layer: int, slots: Sequence[int],
                         start_positions: Sequence[int]) -> Tensor:
@@ -310,16 +357,7 @@ class GPT2(Module):
         else:
             slots = [slot] if isinstance(slot, int) else list(slot or [])
             starts = [start_pos] if isinstance(start_pos, int) else list(start_pos)
-            if len(slots) != batch_size or len(starts) != batch_size:
-                raise ValueError("need one slot and one start_pos per row")
-            if len(set(slots)) != batch_size:
-                raise ValueError("a slot may appear at most once per forward")
-            for s_, start in zip(slots, starts):
-                if cache.length(s_) != start:
-                    raise ValueError(f"slot {s_} holds {cache.length(s_)} positions, "
-                                     f"but start_pos is {start}")
-                if start + seq_len > self.config.n_positions:
-                    raise ValueError("sequence exceeds n_positions")
+            self._check_rows(cache, slots, starts, [seq_len] * batch_size, batch_size)
             positions = np.asarray(starts)[:, None] + np.arange(seq_len)[None, :]
             x = self.token_embeddings(idx) + self.position_embeddings(positions)
             for layer, block in enumerate(self.blocks()):
@@ -328,6 +366,52 @@ class GPT2(Module):
                 cache.lengths[s_] = start + seq_len
         x = self.ln_f(x.view(batch_size * seq_len, self.config.n_embd))
         return self.lm_head(x).view(batch_size, seq_len, self.config.n_vocab)
+
+
+    def _check_rows(self, cache: KVCache, slots: Sequence[int], starts: Sequence[int],
+                    counts: Sequence[int], batch_size: int) -> None:
+        if len(slots) != batch_size or len(starts) != batch_size or len(counts) != batch_size:
+            raise ValueError("need one slot, one start_pos, and one row per batch entry")
+        if batch_size == 0:
+            raise ValueError("batch must contain at least one row")
+        if len(set(slots)) != batch_size:
+            raise ValueError("a slot may appear at most once per forward")
+        for s_, start, count in zip(slots, starts, counts):
+            if count < 1:
+                raise ValueError("every row needs at least one token")
+            if cache.length(s_) != start:
+                raise ValueError(f"slot {s_} holds {cache.length(s_)} positions, "
+                                 f"but start_pos is {start}")
+            if start + count > self.config.n_positions:
+                raise ValueError("sequence exceeds n_positions")
+
+    def forward_ragged(self, rows: Sequence[Sequence[int]], start_positions: Sequence[int],
+                       cache: KVCache, slots: Sequence[int]) -> np.ndarray:
+        """Next-token logits, shape (len(rows), n_vocab), for rows of different lengths.
+
+        Row b is appended to ``slots[b]`` starting at ``start_positions[b]``,
+        which must equal that slot's current length. All rows go through the
+        per-token layers as one flat sequence; only attention pads. Logits are
+        computed for the last token of each row only, since that is the only
+        position a serving step reads. Slot lengths advance on return.
+        """
+        counts = [len(row) for row in rows]
+        starts = list(start_positions)
+        slots = list(slots)
+        self._check_rows(cache, slots, starts, counts, len(rows))
+        flat = np.concatenate([np.asarray(row, dtype=np.int64) for row in rows])[None, :]
+        positions = np.concatenate([start + np.arange(count) for start, count in zip(starts, counts)])[None, :]
+        x = self.token_embeddings(flat) + self.position_embeddings(positions)
+        for layer, block in enumerate(self.blocks()):
+            x = block(x, cache=cache, layer=layer, slots=slots, start_positions=starts, counts=counts)
+        n_tokens = flat.shape[1]
+        hidden = x.to_numpy().reshape(n_tokens, self.config.n_embd)
+        last = np.cumsum(counts) - 1
+        last_hidden = tensor_from_numpy(hidden[last], backend=self.backend)   # (B, n_embd)
+        logits = self.lm_head(self.ln_f(last_hidden))                         # (B, n_vocab)
+        for s_, start, count in zip(slots, starts, counts):
+            cache.lengths[s_] = start + count
+        return logits.to_numpy()
 
 
 def generate_greedy_no_cache(model: GPT2, prompt: list[int], num_tokens: int) -> list[int]:
