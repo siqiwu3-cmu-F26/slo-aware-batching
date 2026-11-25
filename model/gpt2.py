@@ -22,10 +22,14 @@ from minitorch import Linear, LayerNorm1d, Module, Parameter, Tensor, TensorBack
 from minitorch.nn import GELU, softmax
 from minitorch.tensor_functions import tensor_from_numpy
 
+from .ragged_attention import ragged_attention_reference
+
 
 # Large finite negative: exp(MASK - rowmax) underflows to exactly 0 in float32
 # without risking -inf arithmetic inside the softmax.
 MASK_VALUE = -1e9
+
+RAGGED_ATTENTION_MODES = ("padded", "unpadded", "cuda")
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,9 @@ class KVCache:
     prefix it needs into a tensor. ``lengths[slot]`` is how many positions of
     that slot are filled; the scheduler-facing engine owns slot assignment.
     """
+
+    # True for caches whose keys/values live in GPU memory (see CudaKVCache).
+    on_device = False
 
     def __init__(self, config: GPT2Config, max_slots: int) -> None:
         if type(max_slots) is not int or max_slots < 1:
@@ -201,22 +208,28 @@ class CausalSelfAttention(Module):
     def forward(self, x: Tensor, cache: KVCache | None = None, layer: int | None = None,
                 slots: Sequence[int] | None = None,
                 start_positions: Sequence[int] | None = None,
-                counts: Sequence[int] | None = None) -> Tensor:
+                counts: Sequence[int] | None = None, attention: str = "padded") -> Tensor:
         if cache is None:
             q, kT, v = self.project_to_query_key_value(x)
             return self._attend(q, kT, v, self.causal_mask(x.shape[1]))
         if counts is not None:
-            return self._forward_ragged(x, cache, layer, slots, start_positions, counts)
+            return self._forward_ragged(x, cache, layer, slots, start_positions, counts, attention)
         return self._forward_cached(x, cache, layer, slots, start_positions)
 
     def _forward_ragged(self, x: Tensor, cache: KVCache, layer: int, slots: Sequence[int],
-                        start_positions: Sequence[int], counts: Sequence[int]) -> Tensor:
+                        start_positions: Sequence[int], counts: Sequence[int],
+                        attention: str) -> Tensor:
         """Rows of different lengths in one call; ``x`` is (1, sum(counts), n_embd).
 
         Row b owns tokens ``offset_b .. offset_b + counts[b]`` of the flat
-        sequence. Projections run once over all tokens with no padding. Only
-        the attention product is padded: queries to the longest row, keys and
-        values to the longest prefix. Padded query rows are dropped afterwards.
+        sequence. Projections run once over all tokens with no padding. Each
+        row's new keys and values are written to its slot, then attention runs
+        by one of three methods that compute the same result:
+
+        - "padded": MiniTorch ops on a batch padded to the longest row/prefix;
+        - "unpadded": NumPy, one slot at a time (model/ragged_attention.py);
+        - "cuda": the chunked-prefill kernel on a GPU-resident cache
+          (model/cuda_kv_cache.py), which also does the cache write.
         """
         _, n_tokens, n_embd = x.shape
         h, d = self.n_head, self.head_dim
@@ -224,6 +237,32 @@ class CausalSelfAttention(Module):
         q_new = self.q_projection(x_flat).to_numpy().reshape(n_tokens, h, d)
         k_new = self.k_projection(x_flat).to_numpy().reshape(n_tokens, h, d)
         v_new = self.v_projection(x_flat).to_numpy().reshape(n_tokens, h, d)
+        if attention == "cuda":
+            # Only the new tokens' q/k/v go to the GPU; the cache stays there.
+            core = cache.append_and_attend(layer, q_new, k_new, v_new, slots, start_positions, counts)
+        else:
+            offset = 0
+            for slot, start, count in zip(slots, start_positions, counts):
+                rows = slice(offset, offset + count)
+                cache.append(layer, slot, start, k_new[rows].transpose(1, 0, 2), v_new[rows].transpose(1, 0, 2))
+                offset += count
+            if attention == "unpadded":
+                core = ragged_attention_reference(q_new, cache.k[layer], cache.v[layer],
+                                                  slots, start_positions, counts)
+            else:
+                core = self._padded_ragged_attention(q_new, cache, layer, slots, start_positions, counts)
+        out = self.out_projection(tensor_from_numpy(core.reshape(n_tokens, n_embd), backend=self.backend))
+        return out.view(1, n_tokens, n_embd)
+
+    def _padded_ragged_attention(self, q_new: np.ndarray, cache: KVCache, layer: int,
+                                 slots: Sequence[int], start_positions: Sequence[int],
+                                 counts: Sequence[int]) -> np.ndarray:
+        """Attention with MiniTorch ops on a padded batch; returns (n_tokens, h, d).
+
+        Queries are padded to the longest row and keys/values to the longest
+        prefix, a mask hides the padding, and padded query rows are dropped.
+        """
+        h, d = self.n_head, self.head_dim
         batch_size, t_max = len(slots), max(counts)
         totals = [start + count for start, count in zip(start_positions, counts)]
         key_len = max(totals)
@@ -231,10 +270,8 @@ class CausalSelfAttention(Module):
         k_all = np.zeros((batch_size, h, key_len, d), dtype=np.float32)
         v_all = np.zeros((batch_size, h, key_len, d), dtype=np.float32)
         offset = 0
-        for b, (slot, start, count, total) in enumerate(zip(slots, start_positions, counts, totals)):
-            rows = slice(offset, offset + count)
-            q_pad[b, :, :count, :] = q_new[rows].transpose(1, 0, 2)
-            cache.append(layer, slot, start, k_new[rows].transpose(1, 0, 2), v_new[rows].transpose(1, 0, 2))
+        for b, (slot, count, total) in enumerate(zip(slots, counts, totals)):
+            q_pad[b, :, :count, :] = q_new[offset:offset + count].transpose(1, 0, 2)
             k_slot, v_slot = cache.prefix(layer, slot, total)
             k_all[b, :, :total, :] = k_slot
             v_all[b, :, :total, :] = v_slot
@@ -243,10 +280,8 @@ class CausalSelfAttention(Module):
         kT = tensor_from_numpy(k_all.transpose(0, 1, 3, 2), backend=self.backend)
         v = tensor_from_numpy(v_all, backend=self.backend)
         mask = self.batched_mask(t_max, start_positions, key_len)
-        core = self._attention_core(q, kT, v, mask).to_numpy().reshape(batch_size, t_max, n_embd)
-        gathered = np.concatenate([core[b, :count] for b, count in enumerate(counts)], axis=0)
-        out = self.out_projection(tensor_from_numpy(gathered, backend=self.backend))
-        return out.view(1, n_tokens, n_embd)
+        core = self._attention_core(q, kT, v, mask).to_numpy().reshape(batch_size, t_max, h, d)
+        return np.concatenate([core[b, :count] for b, count in enumerate(counts)], axis=0)
 
     def _forward_cached(self, x: Tensor, cache: KVCache, layer: int, slots: Sequence[int],
                         start_positions: Sequence[int]) -> Tensor:
@@ -386,7 +421,7 @@ class GPT2(Module):
                 raise ValueError("sequence exceeds n_positions")
 
     def forward_ragged(self, rows: Sequence[Sequence[int]], start_positions: Sequence[int],
-                       cache: KVCache, slots: Sequence[int]) -> np.ndarray:
+                       cache: KVCache, slots: Sequence[int], attention: str = "padded") -> np.ndarray:
         """Next-token logits, shape (len(rows), n_vocab), for rows of different lengths.
 
         Row b is appended to ``slots[b]`` starting at ``start_positions[b]``,
@@ -394,7 +429,15 @@ class GPT2(Module):
         per-token layers as one flat sequence; only attention pads. Logits are
         computed for the last token of each row only, since that is the only
         position a serving step reads. Slot lengths advance on return.
+
+        ``attention`` is "padded", "unpadded", or "cuda"; "cuda" requires a
+        GPU-resident cache (``cache.on_device``) and the others require a host
+        cache. See CausalSelfAttention._forward_ragged.
         """
+        if attention not in RAGGED_ATTENTION_MODES:
+            raise ValueError(f"attention must be one of {RAGGED_ATTENTION_MODES}")
+        if (attention == "cuda") != cache.on_device:
+            raise ValueError("attention='cuda' needs a CudaKVCache, and a CudaKVCache needs attention='cuda'")
         counts = [len(row) for row in rows]
         starts = list(start_positions)
         slots = list(slots)
@@ -403,7 +446,8 @@ class GPT2(Module):
         positions = np.concatenate([start + np.arange(count) for start, count in zip(starts, counts)])[None, :]
         x = self.token_embeddings(flat) + self.position_embeddings(positions)
         for layer, block in enumerate(self.blocks()):
-            x = block(x, cache=cache, layer=layer, slots=slots, start_positions=starts, counts=counts)
+            x = block(x, cache=cache, layer=layer, slots=slots, start_positions=starts, counts=counts,
+                      attention=attention)
         n_tokens = flat.shape[1]
         hidden = x.to_numpy().reshape(n_tokens, self.config.n_embd)
         last = np.cumsum(counts) - 1

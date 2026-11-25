@@ -84,6 +84,7 @@ class BenchmarkConfig:
     prompt_file: str | None = None
     warmup_steps: int = 20
     execution_mode: str = "ragged"
+    attention: str = "padded"
     clock_mode: str | None = None
 
     def __post_init__(self) -> None:
@@ -235,6 +236,7 @@ def run_one(config: BenchmarkConfig, output_dir: str | Path, resume: bool = True
         real_engine = cast("MiniTorchEngine", engine)
         metadata.update(real_engine.metadata)
         summary.update(execution_mode=real_engine.metadata["execution_mode"],
+                       attention=real_engine.metadata["attention"],
                        prompt_source=real_engine.metadata["prompt_source"], forward_calls=real_engine.forward_calls)
         for name, values in (("prompts", real_engine.prompt_tokens), ("outputs", real_engine.output_tokens)):
             (run_dir / f"{name}.json").write_text(json.dumps(values, indent=2) + "\n", encoding="utf-8")

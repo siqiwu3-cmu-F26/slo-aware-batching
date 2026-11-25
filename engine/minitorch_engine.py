@@ -18,7 +18,8 @@ from typing import Callable, Mapping, Sequence
 import numpy as np
 
 from interfaces import BatchPlan, Request, StepResult
-from model import GPT2, KVCache
+from model import GPT2, CudaKVCache, KVCache
+from model.gpt2 import RAGGED_ATTENTION_MODES
 
 
 def weights_sha256(model: GPT2) -> str:
@@ -47,12 +48,18 @@ class MiniTorchEngine:
                  prompt_seed: int = 0,
                  synchronize: Callable[[], None] | None = None,
                  metadata: Mapping[str, object] | None = None,
-                 execution_mode: str = "ragged") -> None:
+                 execution_mode: str = "ragged", attention: str = "padded") -> None:
         if execution_mode not in EXECUTION_MODES:
             raise ValueError("execution_mode must be ragged or grouped")
+        if attention not in RAGGED_ATTENTION_MODES:
+            raise ValueError(f"attention must be one of {RAGGED_ATTENTION_MODES}")
+        if attention != "padded" and execution_mode != "ragged":
+            raise ValueError("unpadded and cuda attention only apply to ragged execution")
         self.execution_mode = execution_mode
+        self.attention = attention
         self.model = model
-        self.cache = KVCache(model.config, max_slots)
+        # "cuda" keeps keys/values in GPU memory; the others keep them in NumPy.
+        self.cache = CudaKVCache(model.config, max_slots) if attention == "cuda" else KVCache(model.config, max_slots)
         self.max_slots = max_slots
         self._prompts = prompts
         self.prompt_seed = prompt_seed
@@ -72,7 +79,9 @@ class MiniTorchEngine:
             "model_config": asdict(model.config), "precision": "float32",
             "prompt_source": "provided_token_ids" if prompts is not None else "synthetic_length_replay",
             "prompt_seed": prompt_seed, "stopping_rule": "fixed_output_len_ignore_eos",
-            "kv_storage": "host_numpy", "kv_cache_bytes": self.cache.num_bytes,
+            "attention": attention,
+            "kv_storage": "device_cuda" if self.cache.on_device else "host_numpy",
+            "kv_cache_bytes": self.cache.num_bytes,
             "warmup_steps": 0, **metadata,
         }
         self.forward_calls = 0
@@ -124,7 +133,8 @@ class MiniTorchEngine:
                 starts = [self.cache.length(slot) for slot in slots]
                 count = min(2, self.model.config.n_positions) if starts[0] == 0 else 1
                 if self.execution_mode == "ragged":
-                    self.model.forward_ragged([[0] * count] * self.max_slots, starts, self.cache, slots)
+                    self.model.forward_ragged([[0] * count] * self.max_slots, starts, self.cache, slots,
+                                              attention=self.attention)
                 else:
                     self.model(np.zeros((self.max_slots, count), dtype=np.int64), starts, self.cache, slots).to_numpy()
             self._synchronize()
@@ -227,7 +237,8 @@ class MiniTorchEngine:
         rows = [self._inputs(rid, start, count) for rid, start, count in items]
         starts = [start for _, start, _ in items]
         slots = [self._requests[rid].slot for rid, _, _ in items]
-        logits = self.model.forward_ragged(rows, starts, self.cache, slots)   # (B, n_vocab)
+        logits = self.model.forward_ragged(rows, starts, self.cache, slots,
+                                           attention=self.attention)   # (B, n_vocab)
         self.forward_calls += 1
         for row, (rid, _, count) in enumerate(items):
             self._apply(rid, count, logits[row], emitted, finished)
