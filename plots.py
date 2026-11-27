@@ -33,6 +33,8 @@ class SummaryRow:
     def series(self) -> str:
         if self.scheduler == "sarathi" and self.token_budget is not None:
             return f"Sarathi (B={self.token_budget})"
+        if self.scheduler == "slo":
+            return "SLO-aware"
         return self.scheduler.capitalize()
 
 
@@ -66,7 +68,7 @@ def load_summary(path: str | Path) -> list[SummaryRow]:
         rows = []
         for row_number, row in enumerate(reader, 2):
             scheduler = row["scheduler"]
-            if scheduler not in {"static", "orca", "sarathi"}:
+            if scheduler not in {"static", "orca", "sarathi", "slo"}:
                 raise ValueError(f"row {row_number}: unsupported scheduler")
             budget_text = row["token_budget"].strip()
             token_budget = int(budget_text) if budget_text else None
@@ -140,9 +142,11 @@ def _series_sort_key(series: str) -> tuple[int, float | str]:
         return (1, 0)
     if series.startswith("Sarathi (B="):
         return (2, float(series.removeprefix("Sarathi (B=").removesuffix(")")))
+    if series == "SLO-aware":
+        return (3, 0)
     if series.startswith("Arrival rate "):
-        return (3, float(series.removeprefix("Arrival rate ")))
-    return (4, series)
+        return (4, float(series.removeprefix("Arrival rate ")))
+    return (5, series)
 
 
 def _pyplot():

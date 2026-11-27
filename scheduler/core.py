@@ -45,6 +45,10 @@ class _BaseScheduler:
         self.waiting.append(request)
         return True
 
+    def expire(self, now: float) -> list[Event]:
+        """Reject queued requests that can no longer meet their SLO; baselines never do."""
+        return []
+
     def _admit(self) -> None:
         while self.waiting and len(self.active) < self.max_slots:
             request = self.waiting.popleft()

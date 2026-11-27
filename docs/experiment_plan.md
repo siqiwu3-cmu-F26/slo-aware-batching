@@ -44,6 +44,10 @@ All times are in seconds and include queueing after request arrival.
   satisfying both TTFT and mean-TPOT SLOs. Rejected and incomplete requests
   count as failures.
 - **Goodput:** completed requests satisfying both SLOs per second.
+- **P99-TPOT attainment and goodput:** the same, except that a request meets
+  its TPOT SLO only if its own P99 inter-token interval is within the TPOT
+  SLO. The mean-TPOT SLO averages away occasional stalls; this stricter view
+  matches user-visible stutter. Both are reported.
 
 The benchmark stores both per-request mean TPOT and token-level TPOT so the
 report can state the distinction explicitly.

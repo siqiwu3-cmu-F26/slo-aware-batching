@@ -22,6 +22,11 @@ class RequestMetrics:
     meets_ttft_slo: bool | None
     meets_tpot_slo: bool | None
     meets_slo: bool
+    # Stricter TPOT view: the request's own P99 inter-token gap, against the
+    # same tpot_slo. A one-token response has no gap and uses 0, as above.
+    p99_tpot: float | None = None
+    meets_p99_tpot_slo: bool | None = None
+    meets_slo_p99_tpot: bool = False
 
     def to_dict(self) -> dict[str, str | float | int | bool | None]:
         return asdict(self)
@@ -51,6 +56,10 @@ class Metrics:
     total_requests: int
     output_tokens: int
     duration: float
+    # Same as goodput/slo_attainment_rate, but a request meets its TPOT SLO only
+    # if its P99 inter-token gap (not its mean) is within tpot_slo.
+    goodput_p99_tpot: float = 0.0
+    slo_attainment_rate_p99_tpot: float = 0.0
 
     def to_dict(self) -> dict[str, float | int | None]:
         return asdict(self)
@@ -104,6 +113,8 @@ def compute_request_metrics(
         first_time = first.get(rid)
         finish_time = finishes.get(rid)
         ttft = first_time - request.arrival_time if first_time is not None else None
+        gaps = [later - earlier for earlier, later in zip(token_times, token_times[1:])]
+        p99_tpot = (_percentile(gaps, 99) if gaps else 0.0) if token_times else None
         mean_tpot = None
         if token_times:
             # A single-token response has no inter-token gap and uses TPOT=0.
@@ -120,11 +131,20 @@ def compute_request_metrics(
             None if request.tpot_slo is None or mean_tpot is None
             else mean_tpot <= request.tpot_slo
         )
+        meets_p99_tpot = (
+            None if request.tpot_slo is None or p99_tpot is None
+            else p99_tpot <= request.tpot_slo
+        )
         # Missing SLOs impose no constraint. Rejected/incomplete requests fail.
         meets_slo = (
             status == "completed"
             and (request.ttft_slo is None or meets_ttft is True)
             and (request.tpot_slo is None or meets_tpot is True)
+        )
+        meets_slo_p99_tpot = (
+            status == "completed"
+            and (request.ttft_slo is None or meets_ttft is True)
+            and (request.tpot_slo is None or meets_p99_tpot is True)
         )
         rows.append(RequestMetrics(
             request_id=rid,
@@ -141,6 +161,9 @@ def compute_request_metrics(
             meets_ttft_slo=meets_ttft,
             meets_tpot_slo=meets_tpot,
             meets_slo=meets_slo,
+            p99_tpot=p99_tpot,
+            meets_p99_tpot_slo=meets_p99_tpot,
+            meets_slo_p99_tpot=meets_slo_p99_tpot,
         ))
     return rows
 
@@ -175,6 +198,7 @@ def compute_metrics(requests: Iterable[Request], events: Iterable[Event]) -> Met
         )
     ]
     good = sum(row.meets_slo for row in completed)
+    good_p99 = sum(row.meets_slo_p99_tpot for row in completed)
     output_tokens = sum(row.output_tokens for row in per_request)
     total = len(per_request)
 
@@ -205,4 +229,6 @@ def compute_metrics(requests: Iterable[Request], events: Iterable[Event]) -> Met
         total_requests=total,
         output_tokens=output_tokens,
         duration=duration,
+        goodput_p99_tpot=rate(good_p99),
+        slo_attainment_rate_p99_tpot=fraction(good_p99),
     )

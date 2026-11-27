@@ -17,7 +17,7 @@ from engine import create_engine
 from engine.factory import add_engine_arguments, config_from_args
 from interfaces import Engine, Event, EventKind, Request, RequestState, Scheduler
 from metrics import compute_metrics
-from scheduler import FixedBudget, OrcaScheduler, SarathiScheduler, StaticScheduler
+from scheduler import FixedBudget, OrcaScheduler, SarathiScheduler, SloAwareScheduler, StaticScheduler
 
 
 @dataclass
@@ -80,6 +80,7 @@ def run_simulation(requests: Iterable[Request], scheduler: Scheduler, engine: En
             else:
                 now = max(now, requests[index].arrival_time)
         feed_arrivals(now)
+        events.extend(scheduler.expire(now))
         if not scheduler.has_pending:
             continue
         plan = scheduler.plan(clock() - origin if clock_mode == "wall" else now)
@@ -103,10 +104,29 @@ def run_simulation(requests: Iterable[Request], scheduler: Scheduler, engine: En
                             scheduler.deferred_requests, scheduler.deferred_decisions, clock_mode)
 
 
+def add_slo_arguments(parser: argparse.ArgumentParser) -> None:
+    """Stage 4 options, with one switch per component for the ablation."""
+    parser.add_argument("--slo-max-budget", type=int, default=256,
+                        help="largest token budget the SLO-aware scheduler may choose")
+    parser.add_argument("--slo-order", choices=("slack", "fcfs"), default="slack")
+    parser.add_argument("--slo-tpot-target", choices=("mean", "token"), default="mean")
+    parser.add_argument("--slo-no-reject", dest="slo_reject", action="store_false")
+    parser.add_argument("--slo-fixed-budget", dest="slo_adaptive_budget", action="store_false",
+                        help="ablation: keep the budget at --slo-max-budget")
+
+
+def slo_scheduler_from_args(args: argparse.Namespace, max_slots: int,
+                            max_queue_size: int | None) -> SloAwareScheduler:
+    policy = None if args.slo_adaptive_budget else FixedBudget(args.slo_max_budget)
+    return SloAwareScheduler(max_slots, policy, max_queue_size, max_budget=args.slo_max_budget,
+                             order=args.slo_order, reject=args.slo_reject,
+                             tpot_target=args.slo_tpot_target)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_engine_arguments(parser)
-    parser.add_argument("--scheduler", choices=("static", "orca", "sarathi"), default="sarathi")
+    parser.add_argument("--scheduler", choices=("static", "orca", "sarathi", "slo"), default="sarathi")
     parser.add_argument("--trace", type=Path, help="JSON array of Request constructor fields")
     parser.add_argument("--log", type=Path, default=Path("events.jsonl"))
     parser.add_argument("--max-slots", type=int, default=4)
@@ -115,6 +135,7 @@ def main() -> None:
     parser.add_argument("--max-budget", type=int)
     parser.add_argument("--max-change-per-step", type=int, default=0)
     parser.add_argument("--max-queue-size", type=int)
+    add_slo_arguments(parser)
     parser.add_argument("--a", type=float, default=0.01, help="fixed step overhead in seconds")
     parser.add_argument("--b", type=float, default=0.001, help="seconds per planned input token")
     args = parser.parse_args()
@@ -134,7 +155,9 @@ def main() -> None:
     # Validate flags before the potentially slow model load and warmup.
     engine = create_engine(config_from_args(args), args.max_slots, args.a, args.b)
     scheduler: Scheduler
-    if args.scheduler == "sarathi":
+    if args.scheduler == "slo":
+        scheduler = slo_scheduler_from_args(args, args.max_slots, args.max_queue_size)
+    elif args.scheduler == "sarathi":
         policy = FixedBudget(args.token_budget, args.min_budget, args.max_budget,
                              args.max_change_per_step)
         scheduler = SarathiScheduler(args.max_slots, policy, args.max_queue_size)

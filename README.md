@@ -3,15 +3,14 @@
 GPT-2 serving scheduler for MiniTorch. Goal: maximize requests completed within
 latency targets.
 
-Static, Orca, and Sarathi run with either the mock engine or a MiniTorch adapter.
-The adapter currently groups inputs by length; the mixed-batch kernel and
-Stage 4 SLO-aware adaptation are pending.
+Static, Orca, Sarathi, and the Stage 4 SLO-aware scheduler run with either the
+mock engine or a MiniTorch adapter.
 
 ## Structure
 
 ```text
 ├── interfaces.py       # Request, batch plan, engine API, events
-├── scheduler/          # Static / Orca / Sarathi + budget policies
+├── scheduler/          # Static / Orca / Sarathi / SLO-aware + budget policies
 ├── engine/             # Mock engine + MiniTorch adapter and loading
 ├── minitorch/          # Vendored MiniTorch tensor runtime (CPU numba + CUDA backends)
 ├── kernels/            # CUDA sources for MiniTorch's fused kernels + build script
@@ -87,6 +86,39 @@ The plotting pipeline reports the mean and 95% confidence interval across
 seeds. It writes throughput, P99 latency, SLO attainment, goodput, and token
 budget ablation figures, plus `aggregated_plot_data.csv` for auditing.
 
+## SLO-aware scheduling (Stage 4)
+
+`--scheduler slo` (`scheduler/slo.py`) extends Sarathi's stall-free batching.
+Every iteration it:
+
+1. fits step time against tokens per step from the steps it has timed
+   (`scheduler/step_time.py`);
+2. picks the largest token budget whose predicted step still lets every
+   decoding request emit its next token by its TPOT deadline
+   (`SloAwareBudget`), so the budget shrinks under decode pressure and grows
+   to `--slo-max-budget` when decodes have slack;
+3. admits and prefills requests by TTFT slack (deadline minus now minus the
+   fastest possible remaining prefill), least first, with requests that can no
+   longer meet their deadline last;
+4. rejects waiting requests whose TTFT deadline is out of reach even if they
+   started now with the whole budget (a lower bound, so they could not have
+   met their SLO). Only waiting requests are rejected; they hold no KV slot.
+
+`--slo-tpot-target mean` protects the per-request mean TPOT SLO (a request
+ahead of schedule can absorb one long step); `token` protects every
+inter-token gap, matching the per-request P99 TPOT SLO. Ablation switches:
+`--slo-order fcfs`, `--slo-no-reject`, `--slo-fixed-budget`.
+
+```bash
+python3 sim.py --scheduler slo --max-slots 4 --slo-max-budget 256
+python3 benchmark.py --schedulers orca sarathi slo --arrival-rates 1 1.5 2 \
+  --token-budgets 32 256 --ttft-slo 2.25 --tpot-slo 0.022
+```
+
+Summaries also report `goodput_p99_tpot` and `slo_attainment_rate_p99_tpot`:
+the same as goodput and attainment, except that a request meets its TPOT SLO
+only if its own P99 inter-token gap is within `tpot_slo`.
+
 ## MiniTorch integration
 
 CPU smoke test with a tiny random-weight model (no downloads or training):
@@ -148,7 +180,10 @@ See [integration status and midterm handoff](docs/midterm_progress.md).
 - Final prefill emits the first output token; each later decode emits one token.
 - Sarathi's minimum token budget must be at least `max_slots` to fit all decodes.
 - Times use seconds. `tpot_p50/p99` summarize per-request mean TPOT;
-  `token_tpot_p50/p99` summarize all individual inter-token intervals.
+  `token_tpot_p50/p99` summarize all individual inter-token intervals;
+  `p99_tpot` (per request) is that request's own P99 inter-token interval.
+- Schedulers may reject only waiting requests, through `expire(now)`, which
+  the driver calls before every plan; the baselines never reject there.
 - SLO attainment uses all arrived requests as its denominator, so rejected and
   incomplete requests do not attain their SLO.
 
