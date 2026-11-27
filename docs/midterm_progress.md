@@ -5,7 +5,11 @@
 - `MiniTorchEngine` connects the existing GPT2/KVCache to the unchanged schedulers.
 - Registration stores prompts; first execution allocates a slot; completion frees it.
 - Prefill/chunks consume prompt tokens; decodes consume the previous generated token.
-- Equal input lengths batch together. Unequal lengths use separate forwards.
+- Default `ragged` execution runs every plan item in one forward: all rows'
+  new tokens pass through the per-token layers as one flat sequence, only the
+  attention product is padded, and logits are computed for each row's last
+  token only. `--execution-mode grouped` keeps the earlier one-forward-per-span-
+  length behaviour for comparison.
 - Real mode uses wall-clock replay, including scheduler/host overhead. Loading
   and warmup occur before timing; CUDA execution has a synchronization hook.
 - Both CLI drivers select mock or MiniTorch. Real benchmark runs archive prompts,
@@ -36,7 +40,7 @@ execution without arrival waits, but excludes scheduler overhead from latency.
 | Owner | Next work |
 |---|---|
 | Scheduler | Review integrated baselines; implement Stage 4 after baseline measurements. |
-| Engine | Validate the CUDA path; replace grouped execution with variable-query-length mixed batching/chunked-prefill kernel; optimize the host-resident KV path. |
+| Engine | Validate the CUDA path; write the chunked-prefill attention kernel so the padded attention product and the host-resident KV copies move onto the device. |
 | Workload/benchmark | Supply actual ShareGPT prompt token IDs through `--prompts`; calibrate rates/SLOs/budgets on the target GPU; run the experiment matrix and plots. |
 | Everyone | Review interface assumptions, correctness evidence, and midterm claims. |
 

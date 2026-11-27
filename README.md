@@ -110,12 +110,35 @@ synthetic tokens replaying the trace's lengths. The adapter generates exactly
 `output_len` tokens and ignores EOS. Actual inputs, outputs, and execution
 metadata are saved alongside results.
 
-Unequal input lengths use separate forwards; this path has CPU correctness
-coverage and still needs GPU validation and the optimized mixed-batch kernel.
-The KV cache is host-resident numpy (`kv_storage: host_numpy` in metadata), so
-`--backend cuda` timings include per-step host/device cache transfers; label
-GPU numbers accordingly until the cache moves to the device. A benchmark
-process loads the model once and gives each run a fresh KV cache and warmup.
+By default every plan runs in one forward (`--execution-mode ragged`): rows of
+different lengths, such as a prefill chunk beside several decodes, pass through
+the per-token layers as one flat sequence, only the attention product is
+padded, and logits are computed for each row's last token. `--execution-mode
+grouped` keeps one forward per span length for comparison.
+
+`--attention` chooses how ragged execution computes attention; all three give
+the same tokens:
+
+- `padded` (default): MiniTorch ops on a batch padded to the longest row and
+  prefix. The KV cache is host NumPy (`kv_storage: host_numpy`), so on
+  `--backend cuda` every layer copies each row's whole prefix to the GPU.
+- `unpadded`: the NumPy reference in `model/ragged_attention.py`, one slot at a
+  time. CPU only; it defines what the kernel must compute.
+- `cuda`: the chunked-prefill kernel in `kernels/ragged_attention.cu`. The KV
+  cache is allocated once in GPU memory (`kv_storage: device_cuda`); each
+  layer sends only the new tokens' q/k/v and receives the attention output.
+
+On a GPU node:
+
+```bash
+./kernels/compile_cuda.sh                       # also builds ragged_attention.so
+python -m unittest tests.test_ragged_attention -v   # CUDA tests must run, not skip
+python sim.py --engine minitorch --model gpt2 --backend cuda --attention cuda \
+  --scheduler sarathi --max-slots 4 --token-budget 64
+```
+
+A benchmark process loads the model once and gives each run a fresh KV cache
+and warmup.
 See [integration status and midterm handoff](docs/midterm_progress.md).
 
 ## Key interface assumptions

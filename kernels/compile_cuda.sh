@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p minitorch/cuda_kernels
-for name in combine softmax_kernel layernorm_kernel; do
+for name in combine softmax_kernel layernorm_kernel ragged_attention; do
   nvcc -o "minitorch/cuda_kernels/${name}.so" --shared "kernels/${name}.cu" -Xcompiler -fPIC
 done
 echo "built: $(ls minitorch/cuda_kernels)"

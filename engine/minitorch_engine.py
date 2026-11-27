@@ -1,7 +1,9 @@
 """Scheduler adapter around the team's GPT2/KVCache, without new model kernels.
 
-Unequal input spans are grouped by length and executed in separate forwards.
-This is a correctness/integration path, not a fused Sarathi mixed-batch kernel.
+Default execution mode "ragged": every plan item, whatever its span length,
+runs in one forward (GPT2.forward_ragged), which pads only inside attention and
+computes logits only for each row's last token. Mode "grouped" keeps the
+earlier behaviour of one forward per distinct span length, for comparison.
 """
 
 from __future__ import annotations
@@ -16,7 +18,8 @@ from typing import Callable, Mapping, Sequence
 import numpy as np
 
 from interfaces import BatchPlan, Request, StepResult
-from model import GPT2, KVCache
+from model import GPT2, CudaKVCache, KVCache
+from model.gpt2 import RAGGED_ATTENTION_MODES
 
 
 def weights_sha256(model: GPT2) -> str:
@@ -36,14 +39,27 @@ class _RequestProgress:
     slot: int | None = None
 
 
+EXECUTION_MODES = {"ragged": "ragged_single_forward", "grouped": "grouped_by_input_length"}
+
+
 class MiniTorchEngine:
     def __init__(self, model: GPT2, max_slots: int,
                  prompts: Mapping[str, Sequence[int]] | None = None,
                  prompt_seed: int = 0,
                  synchronize: Callable[[], None] | None = None,
-                 metadata: Mapping[str, object] | None = None) -> None:
+                 metadata: Mapping[str, object] | None = None,
+                 execution_mode: str = "ragged", attention: str = "padded") -> None:
+        if execution_mode not in EXECUTION_MODES:
+            raise ValueError("execution_mode must be ragged or grouped")
+        if attention not in RAGGED_ATTENTION_MODES:
+            raise ValueError(f"attention must be one of {RAGGED_ATTENTION_MODES}")
+        if attention != "padded" and execution_mode != "ragged":
+            raise ValueError("unpadded and cuda attention only apply to ragged execution")
+        self.execution_mode = execution_mode
+        self.attention = attention
         self.model = model
-        self.cache = KVCache(model.config, max_slots)
+        # "cuda" keeps keys/values in GPU memory; the others keep them in NumPy.
+        self.cache = CudaKVCache(model.config, max_slots) if attention == "cuda" else KVCache(model.config, max_slots)
         self.max_slots = max_slots
         self._prompts = prompts
         self.prompt_seed = prompt_seed
@@ -59,11 +75,13 @@ class MiniTorchEngine:
         if "weights_sha256" not in metadata:
             metadata["weights_sha256"] = weights_sha256(self.model)
         self.metadata: dict[str, object] = {
-            "engine": "minitorch", "execution_mode": "grouped_by_input_length",
+            "engine": "minitorch", "execution_mode": EXECUTION_MODES[execution_mode],
             "model_config": asdict(model.config), "precision": "float32",
             "prompt_source": "provided_token_ids" if prompts is not None else "synthetic_length_replay",
             "prompt_seed": prompt_seed, "stopping_rule": "fixed_output_len_ignore_eos",
-            "kv_storage": "host_numpy", "kv_cache_bytes": self.cache.num_bytes,
+            "attention": attention,
+            "kv_storage": "device_cuda" if self.cache.on_device else "host_numpy",
+            "kv_cache_bytes": self.cache.num_bytes,
             "warmup_steps": 0, **metadata,
         }
         self.forward_calls = 0
@@ -114,7 +132,11 @@ class MiniTorchEngine:
                     slots = [self.cache.allocate() for _ in range(self.max_slots)]
                 starts = [self.cache.length(slot) for slot in slots]
                 count = min(2, self.model.config.n_positions) if starts[0] == 0 else 1
-                self.model(np.zeros((self.max_slots, count), dtype=np.int64), starts, self.cache, slots).to_numpy()
+                if self.execution_mode == "ragged":
+                    self.model.forward_ragged([[0] * count] * self.max_slots, starts, self.cache, slots,
+                                              attention=self.attention)
+                else:
+                    self.model(np.zeros((self.max_slots, count), dtype=np.int64), starts, self.cache, slots).to_numpy()
             self._synchronize()
         finally:
             for slot in slots:
@@ -166,7 +188,10 @@ class MiniTorchEngine:
         emitted: set[str] = set()
         finished: set[str] = set()
         try:
-            self._run_groups(groups, emitted, finished)
+            if self.execution_mode == "ragged":
+                self._run_ragged(plan.items, emitted, finished)
+            else:
+                self._run_groups(groups, emitted, finished)
         except Exception:
             for rid, (prefilled, generated, slot) in saved.items():
                 request = self._requests[rid]
@@ -188,6 +213,35 @@ class MiniTorchEngine:
         ids = [rid for rid, _, _ in plan.items]
         return StepResult(duration, tuple(rid for rid in ids if rid in emitted),
                           tuple(rid for rid in ids if rid in finished))
+
+    def _inputs(self, rid: str, start: int, count: int) -> list[int]:
+        request = self._requests[rid]
+        if request.prefilled < len(request.prompt):
+            return request.prompt[start:start + count]
+        return [request.generated[-1]]
+
+    def _apply(self, rid: str, count: int, last_logits: np.ndarray,
+               emitted: set[str], finished: set[str]) -> None:
+        request = self._requests[rid]
+        if request.prefilled < len(request.prompt):
+            request.prefilled += count
+        if request.prefilled == len(request.prompt):
+            request.generated.append(int(np.argmax(last_logits)))
+            emitted.add(rid)
+            if len(request.generated) == request.output_len:
+                finished.add(rid)
+
+    def _run_ragged(self, items: Sequence[tuple[str, int, int]],
+                    emitted: set[str], finished: set[str]) -> None:
+        """Whole plan in one forward: prefill chunks and decodes side by side."""
+        rows = [self._inputs(rid, start, count) for rid, start, count in items]
+        starts = [start for _, start, _ in items]
+        slots = [self._requests[rid].slot for rid, _, _ in items]
+        logits = self.model.forward_ragged(rows, starts, self.cache, slots,
+                                           attention=self.attention)   # (B, n_vocab)
+        self.forward_calls += 1
+        for row, (rid, _, count) in enumerate(items):
+            self._apply(rid, count, logits[row], emitted, finished)
 
     def _run_groups(self, groups: Mapping[int, list[tuple[str, int, int]]],
                     emitted: set[str], finished: set[str]) -> None:

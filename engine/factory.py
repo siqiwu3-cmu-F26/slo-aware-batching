@@ -24,10 +24,18 @@ class EngineConfig:
     prompt_seed: int = 0
     prompt_file: str | None = None
     warmup_steps: int = 20
+    execution_mode: str = "ragged"
+    attention: str = "padded"
 
     def __post_init__(self) -> None:
         if self.engine not in {"mock", "minitorch"}:
             raise ValueError("engine must be mock or minitorch")
+        if self.execution_mode not in {"ragged", "grouped"}:
+            raise ValueError("execution_mode must be ragged or grouped")
+        if self.attention not in {"padded", "unpadded", "cuda"}:
+            raise ValueError("attention must be padded, unpadded, or cuda")
+        if self.attention != "padded" and self.execution_mode != "ragged":
+            raise ValueError("unpadded and cuda attention require ragged execution")
         if self.backend not in {"cpu", "cuda"}:
             raise ValueError("backend must be cpu or cuda")
         if type(self.warmup_steps) is not int or self.warmup_steps < 0:
@@ -44,6 +52,11 @@ def add_engine_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prompt-seed", type=int, default=0)
     parser.add_argument("--prompts", dest="prompt_file", help="JSON mapping request ID to prompt token IDs")
     parser.add_argument("--warmup-steps", type=int, default=20)
+    parser.add_argument("--execution-mode", choices=("ragged", "grouped"), default="ragged",
+                        help="ragged: one forward per plan; grouped: one forward per span length")
+    parser.add_argument("--attention", choices=("padded", "unpadded", "cuda"), default="padded",
+                        help="ragged attention: padded MiniTorch ops, unpadded NumPy, or the "
+                             "chunked-prefill CUDA kernel with a GPU-resident KV cache")
     parser.add_argument("--clock", dest="clock_mode", choices=("virtual", "wall"),
                         help="default: virtual for mock, wall for MiniTorch")
 
@@ -125,6 +138,7 @@ def create_engine(config: EngineConfig, max_slots: int, a: float = 0.01,
         if not isinstance(prompts, dict) or any(not isinstance(v, list) for v in prompts.values()):
             raise ValueError("prompt file must map request IDs to lists of token IDs")
     # Each engine gets a fresh KV cache and warmup; only the weights are shared.
-    engine = MiniTorchEngine(model, max_slots, prompts, config.prompt_seed, synchronize, dict(metadata))
+    engine = MiniTorchEngine(model, max_slots, prompts, config.prompt_seed, synchronize, dict(metadata),
+                             execution_mode=config.execution_mode, attention=config.attention)
     engine.warmup(config.warmup_steps)
     return engine
