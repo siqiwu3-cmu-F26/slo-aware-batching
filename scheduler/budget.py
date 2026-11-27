@@ -1,9 +1,14 @@
-"""Budget extension point for the later Stage 4 adaptive policy."""
+"""Token-budget policies and the controller that clamps them."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import TYPE_CHECKING, Protocol, Sequence
 
 from interfaces import Request
+
+if TYPE_CHECKING:
+    from .step_time import StepTimeModel
 
 
 @dataclass(frozen=True)
@@ -12,6 +17,10 @@ class BudgetContext:
     now: float
     active: Sequence[Request]
     waiting: Sequence[Request]
+    # Filled by the SLO-aware scheduler only: the time by which each decoding
+    # request must emit its next token, and the online step-time estimate.
+    next_token_deadlines: Sequence[float] = ()
+    step_time: StepTimeModel | None = None
 
 
 class BudgetPolicy(Protocol):
@@ -48,6 +57,43 @@ class FixedBudget:
 
     def propose(self, context: BudgetContext) -> int:
         return self.tokens
+
+
+@dataclass(frozen=True)
+class SloAwareBudget:
+    """Largest budget whose predicted step keeps every decode on its TPOT deadline.
+
+    With no decoding request it proposes ``max_budget`` so prefills (and TTFT)
+    get the most room; while step time is not yet fitted from two different
+    step sizes, decodes get ``min_budget``. A decode whose
+    deadline is already out of reach even at ``min_budget`` does not constrain
+    the budget: shrinking cannot save it, and would only slow everyone else.
+    """
+
+    min_budget: int
+    max_budget: int
+    # None allows any change per step; the controller treats 0 as "frozen".
+    max_change_per_step: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_change_per_step is None:
+            object.__setattr__(self, "max_change_per_step", self.max_budget - self.min_budget)
+        validate_bounds(self)
+
+    def propose(self, context: BudgetContext) -> int:
+        model = context.step_time
+        if model is None or not context.next_token_deadlines:
+            return self.max_budget
+        if not model.fitted:
+            # One step size cannot tell a late decode from a loose estimate, so
+            # protect decodes; the smaller step also completes the fit.
+            return self.min_budget
+        budget = self.max_budget
+        for deadline in context.next_token_deadlines:
+            fits = model.max_tokens_within(deadline - context.now)
+            if fits >= self.min_budget:
+                budget = min(budget, fits)
+        return budget
 
 
 def validate_bounds(policy: BudgetPolicy) -> None:
