@@ -120,6 +120,10 @@ class Scheduler(Protocol):
 
     def submit(self, request: Request) -> bool: ...
 
+    # Assumption: called before each plan; may reject only waiting requests (they
+    # hold no engine slot) and returns their REJECT events stamped ``now``.
+    def expire(self, now: float) -> list[Event]: ...
+
     def plan(self, now: float) -> BatchPlan: ...
 
     # Assumption: call exactly once per executed plan, at the step-end timestamp.
