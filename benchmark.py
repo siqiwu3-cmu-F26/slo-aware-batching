@@ -19,8 +19,8 @@ from engine import EngineConfig, create_engine
 from engine.factory import add_engine_arguments, runtime_metadata
 from interfaces import Request, Scheduler
 from metrics import compute_metrics, compute_request_metrics
-from scheduler import FixedBudget, OrcaScheduler, SarathiScheduler, StaticScheduler
-from sim import run_simulation
+from scheduler import FixedBudget, OrcaScheduler, SarathiScheduler, SloAwareScheduler, StaticScheduler
+from sim import add_slo_arguments, run_simulation
 from workload import generate_sharegpt_trace, generate_synthetic_trace, write_trace
 
 
@@ -86,6 +86,12 @@ class BenchmarkConfig:
     execution_mode: str = "ragged"
     attention: str = "padded"
     clock_mode: str | None = None
+    # Stage 4 (scheduler="slo") only; ignored by the other schedulers.
+    slo_max_budget: int = 256
+    slo_order: str = "slack"
+    slo_tpot_target: str = "mean"
+    slo_reject: bool = True
+    slo_adaptive_budget: bool = True
 
     def __post_init__(self) -> None:
         self.engine_config  # Validate engine options without importing MiniTorch.
@@ -93,12 +99,14 @@ class BenchmarkConfig:
             object.__setattr__(self, "clock_mode", "wall" if self.engine == "minitorch" else "virtual")
         if self.clock_mode not in {"virtual", "wall"} or (self.engine == "mock" and self.clock_mode != "virtual"):
             raise ValueError("mock requires a virtual clock; real engine accepts virtual or wall")
-        if self.scheduler not in {"static", "orca", "sarathi"}:
+        if self.scheduler not in {"static", "orca", "sarathi", "slo"}:
             raise ValueError("unsupported scheduler")
         if self.scheduler == "sarathi" and self.token_budget is None:
             raise ValueError("Sarathi requires a token budget")
         if self.scheduler != "sarathi" and self.token_budget is not None:
             raise ValueError("only Sarathi uses a token budget")
+        if self.scheduler == "slo":
+            _make_scheduler(self)  # Validate Stage 4 options before any run starts.
         if self.source not in {"synthetic", "sharegpt"}:
             raise ValueError("source must be synthetic or sharegpt")
         if self.source == "sharegpt" and self.dataset is None:
@@ -179,6 +187,11 @@ def _make_scheduler(config: BenchmarkConfig) -> Scheduler:
         return StaticScheduler(config.max_slots, config.max_queue_size)
     if config.scheduler == "orca":
         return OrcaScheduler(config.max_slots, config.max_queue_size)
+    if config.scheduler == "slo":
+        policy = None if config.slo_adaptive_budget else FixedBudget(config.slo_max_budget)
+        return SloAwareScheduler(config.max_slots, policy, config.max_queue_size,
+                                 max_budget=config.slo_max_budget, order=config.slo_order,
+                                 reject=config.slo_reject, tpot_target=config.slo_tpot_target)
     assert config.token_budget is not None
     return SarathiScheduler(
         config.max_slots, FixedBudget(config.token_budget), config.max_queue_size
@@ -300,7 +313,7 @@ def _positive_float(value: str) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_engine_arguments(parser)
-    parser.add_argument("--schedulers", nargs="+", choices=("static", "orca", "sarathi"),
+    parser.add_argument("--schedulers", nargs="+", choices=("static", "orca", "sarathi", "slo"),
                         default=("static", "orca", "sarathi"))
     parser.add_argument("--arrival-rates", nargs="+", type=_positive_float, required=True)
     parser.add_argument("--seeds", nargs="+", type=int, default=(0, 1, 2))
@@ -327,6 +340,7 @@ def main() -> None:
     parser.add_argument("--burst-factor", type=_positive_float, default=5.0)
     parser.add_argument("--burst-fraction", type=float, default=0.1)
     parser.add_argument("--burst-period", type=_positive_float, default=10.0)
+    add_slo_arguments(parser)
     parser.add_argument("--output-dir", type=Path, default=Path("benchmark-results"))
     parser.add_argument("--no-resume", action="store_true",
                         help="rerun configurations that already have a summary")
@@ -362,6 +376,11 @@ def main() -> None:
         burst_period=args.burst_period,
         **{name: getattr(args, name) for name in EngineConfig.__dataclass_fields__},
         clock_mode=args.clock_mode,
+        slo_max_budget=args.slo_max_budget,
+        slo_order=args.slo_order,
+        slo_tpot_target=args.slo_tpot_target,
+        slo_reject=args.slo_reject,
+        slo_adaptive_budget=args.slo_adaptive_budget,
     )
     configs = build_matrix(
         args.schedulers, args.arrival_rates, args.seeds, args.token_budgets, **common
